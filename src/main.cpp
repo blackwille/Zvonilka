@@ -136,8 +136,7 @@ struct AudioConfig {
 
 struct App {
     AudioConfig cfg{};
-    AeadCtx aeadEncode{};
-    AeadCtx aeadDecode{};
+    AeadCtx aead{};
     std::mutex crypto_mtx; // простой guard на смену ключей
 
     ma_context ctx{};
@@ -155,37 +154,24 @@ struct App {
         std::cout << label << " " << ss.str() << "\n";
     }
 
-    bool initCrypto() {
-        if (!rand_bytes(aeadEncode.key.data(), aeadEncode.key.size())) {
-            std::cerr << "RAND key failed\n"; return false;
-        }
-        if (!rand_bytes(aeadEncode.salt.data(), aeadEncode.salt.size())) {
-            std::cerr << "RAND salt failed\n"; return false;
-        }
-        aeadEncode.seq.store(0, std::memory_order_relaxed);
-
-        print_hex("Encode session key:", std::span<const uint8_t>(aeadEncode.key.data(), aeadEncode.key.size()));
-        print_hex("Encode salt:",       std::span<const uint8_t>(aeadEncode.salt.data(), aeadEncode.salt.size()));
-
-        aeadDecode.seq.store(aeadEncode.seq.load(std::memory_order_relaxed),
-                             std::memory_order_relaxed);
-        aeadDecode.key = aeadEncode.key;
-        aeadDecode.salt = aeadEncode.salt;
-        return true;
-    }
-
-    bool changeDecodeCrypto() {
+    bool generateCrypto() {
         std::lock_guard<std::mutex> lg(crypto_mtx);
-        if (!rand_bytes(aeadDecode.key.data(), aeadDecode.key.size())) {
+
+        if (!rand_bytes(aead.key.data(), aead.key.size())) {
             std::cerr << "RAND key failed\n"; return false;
         }
-        if (!rand_bytes(aeadDecode.salt.data(), aeadDecode.salt.size())) {
+        if (!rand_bytes(aead.salt.data(), aead.salt.size())) {
             std::cerr << "RAND salt failed\n"; return false;
         }
-        aeadDecode.seq.store(0, std::memory_order_relaxed);
+        aead.seq.store(0, std::memory_order_relaxed);
 
-        print_hex("Changed decode session key:", std::span<const uint8_t>(aeadDecode.key.data(), aeadDecode.key.size()));
-        print_hex("Changed decode salt:",       std::span<const uint8_t>(aeadDecode.salt.data(), aeadDecode.salt.size()));
+        print_hex("Generated session key:",
+                  std::span<const uint8_t>(aead.key.data(),
+                                           aead.key.size()));
+        print_hex("Generated session salt:",
+                  std::span<const uint8_t>(aead.salt.data(),
+                                           aead.salt.size()));
+
         return true;
     }
 
@@ -211,7 +197,7 @@ struct App {
         std::memcpy(plain.data(), pInput, bytesPCM);
 
         // AAD = seq в BE (8 байт) — фиксируем порядок
-        const uint64_t sealSeq = self->aeadEncode.seq.load(std::memory_order_relaxed);
+        const uint64_t sealSeq = self->aead.seq.load(std::memory_order_relaxed);
         uint64_t aad_be = host_to_be64(sealSeq);
         uint8_t aad[8];
         std::memcpy(aad, &aad_be, 8);
@@ -220,13 +206,13 @@ struct App {
         AeadCtx decodeSnap;
         {
             std::lock_guard<std::mutex> lg(self->crypto_mtx);
-            decodeSnap.key = self->aeadDecode.key;
-            decodeSnap.salt = self->aeadDecode.salt;
+            decodeSnap.key = self->aead.key;
+            decodeSnap.salt = self->aead.salt;
             decodeSnap.seq.store(sealSeq, std::memory_order_relaxed);
         }
 
         std::vector<uint8_t> cipher;
-        if (!aead_seal(self->aeadEncode, std::span<const uint8_t>(aad, 8),
+        if (!aead_seal(self->aead, std::span<const uint8_t>(aad, 8),
                        std::span<const uint8_t>(plain.data(), plain.size()),
                        cipher)) {
             std::memset(pOutput, 0, bytesPCM);
@@ -251,7 +237,7 @@ struct App {
     // открыть/закрыть устройство один раз
     bool open() {
         if (running.load()) return true;
-        if (!initCrypto()) return false;
+        if (!generateCrypto()) return false;
 
         if (ma_context_init(NULL, 0, NULL, &ctx) != MA_SUCCESS) {
             std::cerr << "context init failed\n"; return false;
@@ -304,6 +290,35 @@ struct App {
         capturing.store(false);
     }
 };
+
+bool MicButton(const char* id, bool active)
+{
+    ImGuiStyle& style = ImGui::GetStyle();
+    float size = 40.0f; // диаметр кнопки
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImVec2 center = ImVec2(p.x + size * 0.5f, p.y + size * 0.5f);
+
+    // Невидимая кнопка для ввода мыши
+    ImGui::InvisibleButton(id, ImVec2(size, size), ImGuiButtonFlags_None);
+
+    bool hovered = ImGui::IsItemHovered();
+    bool pressed = ImGui::IsItemClicked();
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddCircleFilled(center,
+                          size * 0.5f,
+                          active ? IM_COL32(255, 60, 60, 255) : // красная если записываем
+                                   IM_COL32(200, 200, 200, 255),
+                          32);
+
+    draw->AddText(
+        ImVec2(center.x - 10, center.y - 8),
+        IM_COL32(0,0,0,255),
+        "mic"
+    );
+
+    return pressed;
+}
 
 int main() {
     std::cout << "Zvonilka demo (SDL3 + ImGui): mic -> AES-GCM -> decrypt -> speakers\n";
@@ -359,17 +374,20 @@ int main() {
         ImGui::Text("Sample Rate: %d, Channels: %d, Frame: %d ms",
                     app.cfg.sampleRate, app.cfg.channels, app.cfg.frameMs);
 
+        
         if (!app.capturing.load()) {
-            if (ImGui::Button("Start")) {
+            if (MicButton("mic_record", false)) {
                 if (!app.start_capture())
                     ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Start failed");
             }
         } else {
-            if (ImGui::Button("Stop")) app.stop_capture();
+            if (MicButton("mic_record", true)) {
+                app.stop_capture();
+            }
         }
         ImGui::SameLine();
         if (ImGui::Button("Rotate Key")) {
-            if (!app.changeDecodeCrypto())
+            if (!app.generateCrypto())
                 ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Rotate failed");
             else
                 ImGui::TextColored(ImVec4(0.3f,1,0.3f,1), "Key rotated");

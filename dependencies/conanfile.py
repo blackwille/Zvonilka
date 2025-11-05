@@ -35,11 +35,11 @@ class ZvonilkaDeps(ConanFile):
             self,
             "*sdl3*",
             os.path.join(pkg_folder, "res", "bindings"),
-            os.path.join(self.source_folder, "imgui_bindings"),
+            os.path.join(self.source_folder, "imgui-bindings"),
         )
         copy(
             self,
             "*opengl3*",
             os.path.join(pkg_folder, "res", "bindings"),
-            os.path.join(self.source_folder, "imgui_bindings"),
+            os.path.join(self.source_folder, "imgui-bindings"),
         )
