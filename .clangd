@@ -1,0 +1,11 @@
+---
+CompileFlags:
+  Add: [ -std=c++20, -Wall, -Wextra, -Wpedantic ]
+  CompilationDatabase: build/Debug
+
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Add: [ bugprone-*, cert-*, modernize-*, performance-*, cppcoreguidelines-* ]
+    Remove: [ bugprone-easily-swappable-parameters, modernize-use-trailing-return-type ]
+...
