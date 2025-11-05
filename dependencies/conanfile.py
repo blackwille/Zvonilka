@@ -14,7 +14,9 @@ class ZvonilkaDeps(ConanFile):
     def requirements(self):
         if self.requires is None:
             return
+        self.requires("miniaudio/0.11.22")
         self.requires("imgui/1.92.2b-docking")
+        self.requires("sdl/3.2.20")
 
     def layout(self):
         cmake_layout(self)
@@ -27,17 +29,17 @@ class ZvonilkaDeps(ConanFile):
         tc.cache_variables["CMAKE_EXPORT_COMPILE_COMMANDS"] = "ON"
         tc.generate()
 
-        # backends для UI (SDL/OpenGL3) в bindings
+        # backends для UI (SDL/OpenGL3) в backends
         pkg_folder = self.dependencies["imgui"].package_folder
         copy(
             self,
             "*sdl3*",
             os.path.join(pkg_folder, "res", "bindings"),
-            os.path.join(self.source_folder, "bindings"),
+            os.path.join(self.source_folder, "imgui_bindings"),
         )
         copy(
             self,
             "*opengl3*",
             os.path.join(pkg_folder, "res", "bindings"),
-            os.path.join(self.source_folder, "bindings"),
+            os.path.join(self.source_folder, "imgui_bindings"),
         )

@@ -1,10 +1,14 @@
-// src/main.cpp
+// Zvonilka demo (SDL3 + ImGui): mic -> AES-256-GCM -> decrypt -> speakers
+#include <SDL3/SDL_init.h>
+#include <SDL3/SDL_video.h>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <string>
@@ -13,10 +17,17 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
+#include "imgui.h"
+#include "imgui-bindings/imgui_impl_sdl3.h"
+#include "imgui-bindings/imgui_impl_opengl3.h"
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_opengl.h>
+
+// ---------- AEAD (AES-256-GCM) ----------
 struct AeadCtx {
-    std::array<uint8_t, 32> key{};  // 256-bit
-    std::array<uint8_t, 12> salt{}; // 96-bit IV prefix
-    std::atomic<uint64_t> seq{0};
+    std::array<uint8_t, 32> key{};   // 256-bit
+    std::array<uint8_t, 12> salt{};  // 96-bit IV prefix (we use first 4 bytes)
+    std::atomic<uint64_t> seq{0};    // per-frame counter (nonce suffix)
 };
 
 static bool rand_bytes(uint8_t *dst, size_t n) {
@@ -36,8 +47,8 @@ static inline uint64_t host_to_be64(uint64_t x) {
 
 static void make_iv(const std::array<uint8_t, 12> &salt, uint64_t seq,
                     uint8_t iv[12]) {
-    // Первые 4 байта — префикс, оставшиеся 8 — счётчик (BE)
-    std::memcpy(iv, salt.data(), 12);
+    // 96-bit IV = 32-bit salt prefix + 64-bit counter (BE)
+    std::memcpy(iv, salt.data(), 4); // важная правка: только 4 байта префикса
     uint64_t be = host_to_be64(seq);
     std::memcpy(iv + 4, &be, 8);
 }
@@ -51,8 +62,7 @@ static bool aead_seal(AeadCtx &ctx, // non-const: seq++
     make_iv(ctx.salt, seq, iv);
 
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
-    if (!c)
-        return false;
+    if (!c) return false;
 
     int ok = 1, len = 0, outLen = 0;
     ok &= EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
@@ -72,8 +82,7 @@ static bool aead_seal(AeadCtx &ctx, // non-const: seq++
     uint8_t tag[16];
     ok &= EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, 16, tag);
     EVP_CIPHER_CTX_free(c);
-    if (!ok)
-        return false;
+    if (!ok) return false;
 
     std::memcpy(outCipher.data() + outLen, tag, 16);
     return true;
@@ -83,8 +92,7 @@ static bool aead_open(const AeadCtx &ctx, uint64_t seq,
                       std::span<const uint8_t> aad,
                       std::span<const uint8_t> cipherWithTag,
                       std::vector<uint8_t> &outPlain) {
-    if (cipherWithTag.size() < 16)
-        return false;
+    if (cipherWithTag.size() < 16) return false;
     const size_t clen = cipherWithTag.size() - 16;
     const uint8_t *tag = cipherWithTag.data() + clen;
 
@@ -92,8 +100,7 @@ static bool aead_open(const AeadCtx &ctx, uint64_t seq,
     make_iv(ctx.salt, seq, iv);
 
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
-    if (!c)
-        return false;
+    if (!c) return false;
 
     int ok = 1, len = 0, outLen = 0;
     ok &= EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
@@ -115,7 +122,9 @@ static bool aead_open(const AeadCtx &ctx, uint64_t seq,
     return ok != 0;
 }
 
+// ---------- Miniaudio: один duplex девайс ----------
 #define MINIAUDIO_IMPLEMENTATION
+// Без ручного выбора бэкенда — miniaudio сам подберёт лучшее для OS.
 #include "miniaudio.h"
 
 struct AudioConfig {
@@ -129,197 +138,263 @@ struct App {
     AudioConfig cfg{};
     AeadCtx aeadEncode{};
     AeadCtx aeadDecode{};
+    std::mutex crypto_mtx; // простой guard на смену ключей
 
     ma_context ctx{};
     ma_device dev{};
 
-    std::atomic<bool> running{false};
+    std::atomic<bool> running{false};    // устройство открыто
+    std::atomic<bool> capturing{false};  // поток запущен
+
+    static void print_hex(const char* label, const std::span<const uint8_t> bytes) {
+        std::stringstream ss;
+        ss << "0x";
+        for (uint8_t b : bytes) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << int(b);
+        }
+        std::cout << label << " " << ss.str() << "\n";
+    }
 
     bool initCrypto() {
         if (!rand_bytes(aeadEncode.key.data(), aeadEncode.key.size())) {
-            std::cerr << "RAND key failed\n";
-            return false;
+            std::cerr << "RAND key failed\n"; return false;
         }
         if (!rand_bytes(aeadEncode.salt.data(), aeadEncode.salt.size())) {
-            std::cerr << "RAND salt failed\n";
-            return false;
+            std::cerr << "RAND salt failed\n"; return false;
         }
-        aeadEncode.seq.store(0);
+        aeadEncode.seq.store(0, std::memory_order_relaxed);
 
-        std::stringstream encodeKey{};
-        encodeKey << "0x";
-        for (const uint64_t &byte : aeadEncode.key) {
-            encodeKey << std::hex << byte;
-        }
-        std::stringstream encodeSalt{};
-        encodeSalt << "0x";
-        for (const uint64_t &byte : aeadEncode.salt) {
-            encodeSalt << std::hex << byte;
-        }
-        std::cout << "Encode session key (" << encodeKey.str() << "), salt ("
-                  << encodeSalt.str() << ")\n";
+        print_hex("Encode session key:", std::span<const uint8_t>(aeadEncode.key.data(), aeadEncode.key.size()));
+        print_hex("Encode salt:",       std::span<const uint8_t>(aeadEncode.salt.data(), aeadEncode.salt.size()));
 
-        aeadDecode.seq.store(aeadEncode.seq);
+        aeadDecode.seq.store(aeadEncode.seq.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
         aeadDecode.key = aeadEncode.key;
         aeadDecode.salt = aeadEncode.salt;
-
         return true;
     }
 
     bool changeDecodeCrypto() {
+        std::lock_guard<std::mutex> lg(crypto_mtx);
         if (!rand_bytes(aeadDecode.key.data(), aeadDecode.key.size())) {
-            std::cerr << "RAND key failed\n";
-            return false;
+            std::cerr << "RAND key failed\n"; return false;
         }
         if (!rand_bytes(aeadDecode.salt.data(), aeadDecode.salt.size())) {
-            std::cerr << "RAND salt failed\n";
-            return false;
+            std::cerr << "RAND salt failed\n"; return false;
         }
-        aeadDecode.seq.store(0);
+        aeadDecode.seq.store(0, std::memory_order_relaxed);
 
-        std::stringstream decodeKey{};
-        decodeKey << "0x";
-        for (const uint64_t &byte : aeadDecode.key) {
-            decodeKey << std::hex << byte;
-        }
-        std::stringstream decodeSalt{};
-        decodeSalt << "0x";
-        for (const uint64_t &byte : aeadDecode.salt) {
-            decodeSalt << std::hex << byte;
-        }
-        std::cout << "Changed decode session key (" << decodeKey.str() << "), salt ("
-                  << decodeSalt.str() << ")\n";
-
+        print_hex("Changed decode session key:", std::span<const uint8_t>(aeadDecode.key.data(), aeadDecode.key.size()));
+        print_hex("Changed decode salt:",       std::span<const uint8_t>(aeadDecode.salt.data(), aeadDecode.salt.size()));
         return true;
     }
 
     static void on_duplex(ma_device *pDevice, void *pOutput, const void *pInput,
                           ma_uint32 frameCount) {
         App *self = (App *)pDevice->pUserData;
-        if (!self || !pOutput)
-            return;
+        if (!self || !pOutput) return;
 
         const ma_uint32 ch = (ma_uint32)self->cfg.channels;
-        const size_t bytesPCM =
-            frameCount * ma_get_bytes_per_frame(ma_format_s16, ch);
+        const size_t bytesPCM = frameCount * ma_get_bytes_per_frame(ma_format_s16, ch);
 
-        // Если нет входа (например, устройство не даёт pInput) — просто тишина
+        if (!self->capturing.load(std::memory_order_relaxed)) {
+            std::memset(pOutput, 0, bytesPCM);
+            return;
+        }
         if (pInput == nullptr) {
             std::memset(pOutput, 0, bytesPCM);
             return;
         }
 
-        // Сериализуем входной PCM (s16 mono) в байты
+        // Копируем входной PCM (s16) в байтовый буфер
         std::vector<uint8_t> plain(bytesPCM);
         std::memcpy(plain.data(), pInput, bytesPCM);
 
-        // В AAD кладём текущий seq (8 байт) — тот же будет на расшифровку
-        uint64_t sealSeq = self->aeadEncode.seq.load(std::memory_order_relaxed);
-        self->aeadDecode.seq.store(sealSeq);
+        // AAD = seq в BE (8 байт) — фиксируем порядок
+        const uint64_t sealSeq = self->aeadEncode.seq.load(std::memory_order_relaxed);
+        uint64_t aad_be = host_to_be64(sealSeq);
         uint8_t aad[8];
-        std::memcpy(aad, &sealSeq, 8);
+        std::memcpy(aad, &aad_be, 8);
+
+        // Снимок ключа/соли для декрипта (простая синхронизация)
+        AeadCtx decodeSnap;
+        {
+            std::lock_guard<std::mutex> lg(self->crypto_mtx);
+            decodeSnap.key = self->aeadDecode.key;
+            decodeSnap.salt = self->aeadDecode.salt;
+            decodeSnap.seq.store(sealSeq, std::memory_order_relaxed);
+        }
 
         std::vector<uint8_t> cipher;
         if (!aead_seal(self->aeadEncode, std::span<const uint8_t>(aad, 8),
                        std::span<const uint8_t>(plain.data(), plain.size()),
                        cipher)) {
-            // Не рискуем — тишина
             std::memset(pOutput, 0, bytesPCM);
             return;
         }
 
         std::vector<uint8_t> decrypted;
-        if (!aead_open(self->aeadDecode, sealSeq, std::span<const uint8_t>(aad, 8),
+        if (!aead_open(decodeSnap, sealSeq, std::span<const uint8_t>(aad, 8),
                        cipher, decrypted)) {
             std::memset(pOutput, 0, bytesPCM);
             std::cerr << "wrong decode..." << std::endl;
             return;
         }
 
-        // Копируем назад в выводной буфер (s16)
-        std::memcpy(pOutput, decrypted.data(),
-                    std::min(decrypted.size(), bytesPCM));
+        // Воспроизведение
+        std::memcpy(pOutput, decrypted.data(), std::min(decrypted.size(), bytesPCM));
         if (decrypted.size() < bytesPCM) {
-            std::memset((uint8_t *)pOutput + decrypted.size(), 0,
-                        bytesPCM - decrypted.size());
+            std::memset((uint8_t *)pOutput + decrypted.size(), 0, bytesPCM - decrypted.size());
         }
     }
 
-    bool initDevice() {
-        // Контекст только ALSA
-        static ma_backend backends[] = {ma_backend_alsa};
-        ma_context_config cctx = ma_context_config_init();
-        if (ma_context_init(backends, 1, &cctx, &ctx) != MA_SUCCESS) {
-            std::cerr << "context init failed (ALSA)\n";
-            return false;
-        }
+    // открыть/закрыть устройство один раз
+    bool open() {
+        if (running.load()) return true;
+        if (!initCrypto()) return false;
 
+        if (ma_context_init(NULL, 0, NULL, &ctx) != MA_SUCCESS) {
+            std::cerr << "context init failed\n"; return false;
+        }
         ma_device_config cfgd = ma_device_config_init(ma_device_type_duplex);
         cfgd.sampleRate = (ma_uint32)cfg.sampleRate;
         cfgd.capture.format = ma_format_s16;
         cfgd.capture.channels = (ma_uint32)cfg.channels;
         cfgd.playback.format = ma_format_s16;
         cfgd.playback.channels = (ma_uint32)cfg.channels;
-
-        // Попросим miniaudio уравнять периоды ввода/вывода (важно для ALSA)
-        cfgd.periodSizeInFrames = (ma_uint32)cfg.framesPerBuffer(); // 20ms
+        cfgd.periodSizeInFrames = (ma_uint32)cfg.framesPerBuffer();
         cfgd.periods = 3;
-
         cfgd.dataCallback = on_duplex;
         cfgd.pUserData = this;
 
         if (ma_device_init(&ctx, &cfgd, &dev) != MA_SUCCESS) {
             std::cerr << "device init failed\n";
+            ma_context_uninit(&ctx);
             return false;
         }
-
-        std::cout << "Audio init OK: " << cfg.sampleRate << " Hz, "
-                  << cfg.channels << " ch, frame " << cfg.framesPerBuffer()
-                  << " samples\n";
+        running.store(true);
+        std::cout << "Audio open OK: " << cfg.sampleRate << " Hz, "
+                  << cfg.channels << " ch, frame " << cfg.framesPerBuffer() << "\n";
         return true;
     }
 
-    void start() {
-        running.store(true);
-        if (ma_device_start(&dev) != MA_SUCCESS) {
-            std::cerr << "device start failed\n";
-            running.store(false);
-        }
-    }
-
-    void stop() {
-        running.store(false);
-        ma_device_stop(&dev);
+    void close() {
+        if (!running.load()) return;
+        stop_capture();
         ma_device_uninit(&dev);
         ma_context_uninit(&ctx);
-        std::cout << "Stopped.\n";
+        running.store(false);
+        std::cout << "Audio closed.\n";
+    }
+
+    bool start_capture() {
+        if (!running.load()) return false;
+        if (capturing.load()) return true;
+        if (ma_device_start(&dev) != MA_SUCCESS) {
+            std::cerr << "device start failed\n"; return false;
+        }
+        capturing.store(true);
+        return true;
+    }
+
+    void stop_capture() {
+        if (!running.load()) return;
+        if (!capturing.load()) return;
+        ma_device_stop(&dev);
+        capturing.store(false);
     }
 };
 
 int main() {
-    std::cout
-        << "Zvonilka demo: mic -> AES-GCM -> decrypt -> speakers (duplex)\n";
-    App app;
-    if (!app.initCrypto())
-        return 1;
-    if (!app.initDevice())
-        return 1;
+    std::cout << "Zvonilka demo (SDL3 + ImGui): mic -> AES-GCM -> decrypt -> speakers\n";
 
-    app.start();
-    std::cout << "Running. Press ENTER to rotate key, 'q'+ENTER to quit.\n";
-
-    for (;;) {
-        std::string line;
-        if (!std::getline(std::cin, line))
-            break;
-        if (line == "q" || line == "Q")
-            break;
-        if (!app.changeDecodeCrypto())
-            std::cerr << "Key rotate failed\n";
-        else
-            std::cout << "Key rotated (new session)\n";
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_EVENTS)) {
+        std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
+        return 1;
     }
 
-    app.stop();
+    const char* glsl_version = "#version 130";
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+
+    SDL_Window* window = SDL_CreateWindow("Zvonilka", 800, 480,
+                                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    if (!window) {
+        std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
+        SDL_Quit();
+        return 1;
+    }
+
+    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
+    SDL_GL_MakeCurrent(window, gl_context);
+    SDL_GL_SetSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGui::StyleColorsDark();
+    ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
+    App app;
+    (void)app.open(); // пробуем открыть аудио; если не вышло — GUI всё равно покажем
+
+    bool done = false;
+    while (!done) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            ImGui_ImplSDL3_ProcessEvent(&e);
+            if (e.type == SDL_EVENT_QUIT) done = true;
+            if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                e.window.windowID == SDL_GetWindowID(window)) done = true;
+        }
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::Begin("Control");
+        ImGui::Text("Sample Rate: %d, Channels: %d, Frame: %d ms",
+                    app.cfg.sampleRate, app.cfg.channels, app.cfg.frameMs);
+
+        if (!app.capturing.load()) {
+            if (ImGui::Button("Start")) {
+                if (!app.start_capture())
+                    ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Start failed");
+            }
+        } else {
+            if (ImGui::Button("Stop")) app.stop_capture();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Rotate Key")) {
+            if (!app.changeDecodeCrypto())
+                ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "Rotate failed");
+            else
+                ImGui::TextColored(ImVec4(0.3f,1,0.3f,1), "Key rotated");
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Device: %s", app.running.load() ? "open" : "not open");
+        ImGui::Text("Capturing: %s", app.capturing.load() ? "yes" : "no");
+        ImGui::Text("Hint: Start = begin duplex stream; Stop = pause stream.");
+        ImGui::End();
+
+        ImGui::Render();
+        glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        SDL_GL_SwapWindow(window);
+    }
+
+    app.close();
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+    SDL_GL_DestroyContext(gl_context);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
     return 0;
 }

@@ -1,5 +1,4 @@
 #!/bin/sh
 
-PARENT_DIR=$(dirname $(dirname $(realpath $0)))
-DEPENDENCIES_DIR=${PARENT_DIR}
+DEPENDENCIES_DIR=$(dirname $(dirname $(dirname $(realpath $0))))
 conan install ${DEPENDENCIES_DIR} --build=missing --settings=build_type=Debug
