@@ -7,6 +7,7 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_opengl.h>
 #include <SDL3/SDL_video.h>
+#include <GLES3/gl3.h>
 
 #include <algorithm>
 #include <array>
@@ -44,6 +45,72 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+// ------- Voice Orb Shader -------
+
+constexpr static const char* ORB_VERT = R"(
+#version 330 core
+layout(location = 0) in vec2 pos;
+out vec2 uv;
+void main() {
+    uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+)";
+
+constexpr static const char* ORB_FRAG = R"(
+#version 330 core
+in vec2 uv;
+out vec4 FragColor;
+
+uniform float level; // 0..1
+
+void main() {
+    vec2 c = uv - vec2(0.5);
+    float r = length(c);
+
+    // радиус шара зависит от level
+    float radius = 0.2 + level * 3;
+    float edge   = smoothstep(radius, radius - 0.1, r);
+
+    vec3 col = mix(vec3(0.2, 0.6, 0.8), vec3(0.8, 0.6, 0.2), level * 3);
+
+    FragColor = vec4(col * (1.0 - edge), 1.0);
+}
+)";
+
+static GLuint CompileShader(GLenum type, const char* src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetShaderInfoLog(sh, 1024, nullptr, log);
+        std::cerr << "Shader compile error: " << log << "\n";
+    }
+    return sh;
+}
+
+static GLuint CreateProgram(const char* vs, const char* fs) {
+    GLuint v = CompileShader(GL_VERTEX_SHADER, vs);
+    GLuint f = CompileShader(GL_FRAGMENT_SHADER, fs);
+    GLuint p = glCreateProgram();
+    glAttachShader(p, v);
+    glAttachShader(p, f);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetProgramInfoLog(p, 1024, nullptr, log);
+        std::cerr << "Program link error: " << log << "\n";
+    }
+    glDeleteShader(v);
+    glDeleteShader(f);
+    return p;
+}
 
 // ---------- мелкие хелперы ----------
 
@@ -870,6 +937,50 @@ static bool MicButton(const char *id, bool active) {
     return pressed;
 }
 
+// Вычисление Фурье
+// TODO: Использовать!
+void ComputeDFT(const std::array<float,512>& buf,
+                std::array<float,32>& out)
+{
+    int N = buf.size();
+    int K = out.size();
+
+    for (int k = 0; k < K; ++k) {
+        float re = 0, im = 0;
+        for (int n = 0; n < N; ++n) {
+            float angle = 2.0f * 3.1415926f * k * n / N;
+            re += buf[n] * cosf(angle);
+            im -= buf[n] * sinf(angle);
+        }
+        out[k] = sqrtf(re * re + im * im) / N;
+    }
+}
+
+// Визуализация спектра голоса собеседника
+// TODO: Использовать!
+void DrawSpectrum(const std::array<float,32>& s) {
+    float w = ImGui::GetContentRegionAvail().x;
+    float barW = w / s.size();
+
+    float h = 80.0f;
+    ImVec2 base = ImGui::GetCursorScreenPos();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    for (int i = 0; i < s.size(); ++i) {
+        float lvl = std::min(1.0f, s[i] * 8.0f);
+        float barH = lvl * h;
+
+        ImVec2 p1 = ImVec2(base.x + barW * i, base.y + h - barH);
+        ImVec2 p2 = ImVec2(base.x + barW * (i + 1) - 2, base.y + h);
+
+        ImU32 col = IM_COL32(80, 180, 255, 255);
+        dl->AddRectFilled(p1, p2, col);
+    }
+
+    ImGui::Dummy(ImVec2(0, h));
+}
+
 // Простая визуализация уровня голоса собеседника
 static void DrawVoiceLevel(float level) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -890,6 +1001,117 @@ static void DrawVoiceLevel(float level) {
     float w = size.x * clamped;
     ImVec2 p3 = ImVec2(pos.x + w, pos.y + size.y);
     draw->AddRectFilled(p1, p3, fgCol, 6.0f);
+}
+
+void DrawVoiceOrb(float level) {
+    // Ленивое создание шейдера и геометрии
+    static bool   initialized = false;
+    static GLuint prog        = 0;
+    static GLint  levelLoc    = -1;
+    static GLuint vao         = 0;
+    static GLuint vbo         = 0;
+
+    if (!initialized) {
+        prog     = CreateProgram(ORB_VERT, ORB_FRAG);
+        levelLoc = glGetUniformLocation(prog, "level");
+
+        float quadVerts[] = {
+            -1.f, -1.f,
+             1.f, -1.f,
+             1.f,  1.f,
+            -1.f, -1.f,
+             1.f,  1.f,
+            -1.f,  1.f
+        };
+
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+                              2 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+
+        initialized = true;
+    }
+
+    // Размер орба в окне (можно подогнать)
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float size   = std::min(avail.x, 300.0f);
+    ImVec2 widgetSize(size, size);
+
+    // Позиция верхнего левого угла виджета в координатах фреймбуфера ImGui
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+
+    // Резервируем место под орб
+    ImGui::InvisibleButton("##voice_orb", widgetSize);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Нам нужен прямоугольник орба и высота фреймбуфера,
+    // чтобы правильно выставить glViewport/glScissor
+    ImVec2 min = pos;
+    ImVec2 max = ImVec2(pos.x + widgetSize.x, pos.y + widgetSize.y);
+    float fbHeight = ImGui::GetIO().DisplaySize.y;
+
+    struct OrbCtx {
+        GLuint prog;
+        GLint  levelLoc;
+        GLuint vao;
+        float  level;
+        ImVec2 min;
+        ImVec2 max;
+        float  fbHeight;
+    };
+
+    auto* ctx = new OrbCtx{
+        prog,
+        levelLoc,
+        vao,
+        std::clamp(level, 0.0f, 1.0f),
+        min,
+        max,
+        fbHeight
+    };
+
+    dl->AddCallback(
+        [](const ImDrawList*, const ImDrawCmd* cmd) {
+            auto* c = static_cast<OrbCtx*>(cmd->UserCallbackData);
+
+            // Преобразуем координаты ImGui (x1,y1,x2,y2) в viewport/scissor OpenGL
+            int x      = (int)c->min.x;
+            int yTop   = (int)c->min.y;
+            int width  = (int)(c->max.x - c->min.x);
+            int height = (int)(c->max.y - c->min.y);
+
+            // OpenGL считает Y от нижнего края, ImGui — от верхнего
+            int y = (int)(c->fbHeight) - yTop - height;
+
+            // Ограничиваем и viewport, и scissor, чтобы орб рисовался только в этом прямоугольнике
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(x, y, width, height);
+            glViewport(x, y, width, height);
+
+            glUseProgram(c->prog);
+            glUniform1f(c->levelLoc, c->level);
+            glBindVertexArray(c->vao);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            glBindVertexArray(0);
+            glUseProgram(0);
+
+            // Сбрасывать scissor не обязательно — ImGui всё равно ResetRenderState,
+            // но можно, чтобы не оставлять мусор
+            glDisable(GL_SCISSOR_TEST);
+
+            delete c;
+        },
+        ctx
+    );
+
+    dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 }
 
 // ---------- main ----------
@@ -1050,11 +1272,15 @@ int main(int, char **) {
         ImGui::Text("Network:  %s", app.netRunning.load() ? "on" : "off");
 
         ImGui::Separator();
+
         ImGui::Text("Remote voice level:");
         float lvl = app.remoteLevel.load(std::memory_order_relaxed);
         lvl *= 0.9f; // затухание между кадрами
         app.remoteLevel.store(lvl, std::memory_order_relaxed);
         DrawVoiceLevel(lvl);
+
+        ImGui::Text("Voice animation shader:");
+        DrawVoiceOrb(lvl);
 
         if (!app.lastError.empty()) {
             ImGui::Separator();
