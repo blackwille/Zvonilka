@@ -17,6 +17,7 @@ class ZvonilkaDeps(ConanFile):
         self.requires("miniaudio/0.11.22")
         self.requires("imgui/1.92.2b-docking")
         self.requires("sdl/3.2.20")
+        self.requires("opus/1.5.2")
 
     def layout(self):
         cmake_layout(self)
@@ -35,11 +36,11 @@ class ZvonilkaDeps(ConanFile):
             self,
             "*sdl3*",
             os.path.join(pkg_folder, "res", "bindings"),
-            os.path.join(self.source_folder, "imgui-bindings"),
+            os.path.join(self.source_folder, "imgui_bindings"),
         )
         copy(
             self,
             "*opengl3*",
             os.path.join(pkg_folder, "res", "bindings"),
-            os.path.join(self.source_folder, "imgui-bindings"),
+            os.path.join(self.source_folder, "imgui_bindings"),
         )

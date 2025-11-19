@@ -18,8 +18,8 @@
 #include <openssl/rand.h>
 
 #include "imgui.h"
-#include "imgui-bindings/imgui_impl_sdl3.h"
-#include "imgui-bindings/imgui_impl_opengl3.h"
+#include "imgui_bindings/imgui_impl_sdl3.h"
+#include "imgui_bindings/imgui_impl_opengl3.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
 
@@ -349,7 +349,6 @@ int main() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
-    ImGui::StyleColorsDark();
     ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
@@ -370,7 +369,19 @@ int main() {
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Control");
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(window, &w, &h);
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(w), static_cast<float>(h)));
+        // clang-format off
+        ImGui::Begin("Control", nullptr,
+            ImGuiWindowFlags_NoTitleBar | 
+            ImGuiWindowFlags_NoResize   |
+            ImGuiWindowFlags_NoMove     | 
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+        // clang-format on
+
         ImGui::Text("Sample Rate: %d, Channels: %d, Frame: %d ms",
                     app.cfg.sampleRate, app.cfg.channels, app.cfg.frameMs);
 

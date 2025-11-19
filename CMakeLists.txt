@@ -18,11 +18,12 @@ find_package(OpenSSL REQUIRED)
 find_package(SDL3 REQUIRED)           
 find_package(OpenGL REQUIRED)
 find_package(miniaudio REQUIRED)   
+find_package(Opus REQUIRED)
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
-    ${DEPENDENCIES_DIR}/imgui-bindings/imgui_impl_sdl3.cpp
-    ${DEPENDENCIES_DIR}/imgui-bindings/imgui_impl_opengl3.cpp
+    ${DEPENDENCIES_DIR}/imgui_bindings/imgui_impl_sdl3.cpp
+    ${DEPENDENCIES_DIR}/imgui_bindings/imgui_impl_opengl3.cpp
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -32,6 +33,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     SDL3::SDL3
     OpenGL::GL
     miniaudio::miniaudio
+    Opus::opus
 )
 
 add_subdirectory(src)
