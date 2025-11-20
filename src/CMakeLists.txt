@@ -1,1 +1,1 @@
-
+file(COPY "${CMAKE_SOURCE_DIR}/src/shaders" DESTINATION ${CMAKE_BINARY_DIR})
