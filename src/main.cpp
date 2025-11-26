@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1054,19 +1055,20 @@ void DrawVoiceOrb(const std::string &execPath, float level) {
         GLint timeLoc;
         GLuint vao;
         float level;
-        int time;
+        float time;
         ImVec2 min;
         ImVec2 max;
         float fbHeight;
     };
 
+    static size_t startMsec = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto *ctx = new OrbCtx{
         .prog = prog,
         .levelLoc = levelLoc,
         .timeLoc = timeLoc,
         .vao = vao,
         .level = std::clamp(level, 0.0f, 1.0f),
-        .time = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) / 10 % 1000,
+        .time = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - startMsec) / 1000,
         .min = min,
         .max = max,
         .fbHeight = fbHeight};
@@ -1093,7 +1095,7 @@ void DrawVoiceOrb(const std::string &execPath, float level) {
 
             glUseProgram(c->prog);
             glUniform1f(c->levelLoc, c->level);
-            glUniform1i(c->timeLoc, c->time);
+            glUniform1f(c->timeLoc, c->time);
             glBindVertexArray(c->vao);
             glDrawArrays(GL_TRIANGLES, 0, 6);
             glBindVertexArray(0);
