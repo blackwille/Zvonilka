@@ -14,6 +14,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -23,13 +25,23 @@
 #include <iomanip>
 #include <ios>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <netdb.h>
 #include <span>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
+#include <glib.h>
+#include <glib-object.h>
+#include <nice/address.h>
+#include <nice/agent.h>
+#include <nice/debug.h>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -103,6 +115,295 @@ static uint64_t be64_to_host(uint64_t x) { return host_to_be64(x); }
 
 static bool rand_bytes(uint8_t *dst, size_t n) {
     return RAND_bytes(dst, (int)n) == 1;
+}
+
+static std::string b64_encode(const uint8_t *data, size_t len) {
+    if (!data || len == 0)
+        return {};
+    size_t outLen = 4 * ((len + 2) / 3);
+    std::string out(outLen, '\0');
+    int n = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(out.data()),
+                            reinterpret_cast<const unsigned char *>(data),
+                            (int)len);
+    if (n < 0)
+        return {};
+    out.resize((size_t)n);
+    return out;
+}
+
+static bool b64_decode(const std::string &in, std::vector<uint8_t> &out) {
+    if (in.empty())
+        return false;
+    size_t outLen = 3 * (in.size() / 4) + 4;
+    out.resize(outLen);
+    int n = EVP_DecodeBlock(out.data(),
+                            reinterpret_cast<const unsigned char *>(in.data()),
+                            (int)in.size());
+    if (n < 0)
+        return false;
+    size_t pad = 0;
+    if (!in.empty()) {
+        if (in[in.size() - 1] == '=')
+            pad++;
+        if (in.size() > 1 && in[in.size() - 2] == '=')
+            pad++;
+    }
+    size_t finalLen = n >= (int)pad ? (size_t)(n - (int)pad) : 0;
+    out.resize(finalLen);
+    return true;
+}
+
+static bool pubkey_to_der(EVP_PKEY *pkey, std::vector<uint8_t> &der) {
+    if (!pkey)
+        return false;
+    int len = i2d_PUBKEY(pkey, nullptr);
+    if (len <= 0)
+        return false;
+    der.resize((size_t)len);
+    unsigned char *p = der.data();
+    if (i2d_PUBKEY(pkey, &p) != len)
+        return false;
+    return true;
+}
+
+static EVP_PKEY *pubkey_from_der(const uint8_t *data, size_t len) {
+    const unsigned char *p = data;
+    return d2i_PUBKEY(nullptr, &p, (long)len);
+}
+
+static bool rsa_encrypt(EVP_PKEY *pub, std::span<const uint8_t> plain,
+                        std::vector<uint8_t> &cipher) {
+    if (!pub)
+        return false;
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pub, nullptr);
+    if (!ctx)
+        return false;
+    bool ok = false;
+    if (EVP_PKEY_encrypt_init(ctx) > 0 &&
+        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) > 0 &&
+        EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) > 0 &&
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) > 0) {
+        size_t outLen = 0;
+        if (EVP_PKEY_encrypt(ctx, nullptr, &outLen, plain.data(),
+                             plain.size()) > 0) {
+            cipher.resize(outLen);
+            if (EVP_PKEY_encrypt(ctx, cipher.data(), &outLen, plain.data(),
+                                 plain.size()) > 0) {
+                cipher.resize(outLen);
+                ok = true;
+            }
+        }
+    }
+    EVP_PKEY_CTX_free(ctx);
+    return ok;
+}
+
+static bool rsa_decrypt(EVP_PKEY *priv, std::span<const uint8_t> cipher,
+                        std::vector<uint8_t> &plain) {
+    if (!priv)
+        return false;
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(priv, nullptr);
+    if (!ctx)
+        return false;
+    bool ok = false;
+    if (EVP_PKEY_decrypt_init(ctx) > 0 &&
+        EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) > 0 &&
+        EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) > 0 &&
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) > 0) {
+        size_t outLen = 0;
+        if (EVP_PKEY_decrypt(ctx, nullptr, &outLen, cipher.data(),
+                             cipher.size()) > 0) {
+            plain.resize(outLen);
+            if (EVP_PKEY_decrypt(ctx, plain.data(), &outLen, cipher.data(),
+                                 cipher.size()) > 0) {
+                plain.resize(outLen);
+                ok = true;
+            }
+        }
+    }
+    EVP_PKEY_CTX_free(ctx);
+    return ok;
+}
+
+static std::string trim(const std::string &s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start])))
+        ++start;
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1])))
+        --end;
+    return s.substr(start, end - start);
+}
+
+static std::vector<std::string> split(const std::string &s, char delim) {
+    std::vector<std::string> out;
+    std::string cur;
+    std::stringstream ss(s);
+    while (std::getline(ss, cur, delim)) {
+        out.push_back(cur);
+    }
+    return out;
+}
+
+static uint16_t default_port_for_user(const std::string &username) {
+    uint32_t h = 0;
+    for (char c : username) {
+        h = h * 131 + static_cast<unsigned char>(c);
+    }
+    // 35000-45000 — чтобы не конфликтовать с системными сервисами
+    return static_cast<uint16_t>(35000 + (h % 10000));
+}
+
+static std::filesystem::path secrets_path(const std::string &exeDir,
+                                          const std::string &file) {
+    return std::filesystem::path(exeDir) / "secrets" / file;
+}
+
+static bool parse_host_port_url(const std::string &url, std::string &hostOut,
+                                uint16_t &portOut) {
+    std::string s = url;
+    if (s.rfind("http://", 0) == 0)
+        s = s.substr(7);
+    else if (s.rfind("https://", 0) == 0)
+        s = s.substr(8);
+    size_t slash = s.find('/');
+    if (slash != std::string::npos)
+        s = s.substr(0, slash);
+    size_t colon = s.rfind(':');
+    hostOut.clear();
+    portOut = 0;
+    if (colon == std::string::npos) {
+        hostOut = s;
+        portOut = 7777; // default for our simple signalling
+        return !hostOut.empty();
+    }
+    hostOut = s.substr(0, colon);
+    try {
+        portOut = static_cast<uint16_t>(std::stoi(s.substr(colon + 1)));
+    } catch (...) {
+        return false;
+    }
+    return !hostOut.empty() && portOut > 0;
+}
+
+static bool resolve_ipv4(const std::string &host, uint16_t port,
+                         sockaddr_in &out) {
+    std::memset(&out, 0, sizeof(out));
+    out.sin_family = AF_INET;
+    out.sin_port = htons(port);
+    if (inet_pton(AF_INET, host.c_str(), &out.sin_addr) == 1) {
+        return true;
+    }
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo *res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res)
+        return false;
+    auto *addr = reinterpret_cast<sockaddr_in *>(res->ai_addr);
+    out.sin_addr = addr->sin_addr;
+    freeaddrinfo(res);
+    return true;
+}
+
+static bool tcp_send_recv_line(const sockaddr_in &sa, const std::string &line,
+                               std::string &respLine, int timeoutMs) {
+    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+        return false;
+    timeval tv{};
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (::connect(sock, reinterpret_cast<const sockaddr *>(&sa), sizeof(sa)) <
+        0) {
+        ::close(sock);
+        return false;
+    }
+    std::string payload = line;
+    if (payload.empty() || payload.back() != '\n')
+        payload.push_back('\n');
+    if (::send(sock, payload.data(), (int)payload.size(), 0) <
+        (ssize_t)payload.size()) {
+        ::close(sock);
+        return false;
+    }
+    respLine.clear();
+    char buf[512];
+    while (true) {
+        ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0)
+            break;
+        respLine.append(buf, buf + n);
+        if (respLine.find('\n') != std::string::npos)
+            break;
+    }
+    ::close(sock);
+    size_t nl = respLine.find('\n');
+    if (nl != std::string::npos)
+        respLine = respLine.substr(0, nl);
+    // trim CR
+    if (!respLine.empty() && respLine.back() == '\r')
+        respLine.pop_back();
+    return !respLine.empty();
+}
+
+struct UserRecord {
+    std::string username;
+    std::string password;
+    std::string host;
+    uint16_t port{0}; // 0 => использовать default_port_for_user
+};
+
+struct TurnProbeState {
+    std::atomic<bool> done{false};
+    std::atomic<bool> timedOut{false};
+    GMainLoop *loop{nullptr};
+    GSource *timeout{nullptr};
+    std::atomic<int> relayCount{0};
+};
+
+static void on_candidates_gathered_cb(NiceAgent *, guint, gpointer user_data) {
+    auto *state = static_cast<TurnProbeState *>(user_data);
+    if (state) {
+        state->done.store(true, std::memory_order_relaxed);
+        if (state->loop)
+            g_main_loop_quit(state->loop);
+    }
+}
+
+static const char *candidate_type_str(NiceCandidateType t) {
+    switch (t) {
+    case NICE_CANDIDATE_TYPE_HOST:
+        return "host";
+    case NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE:
+        return "srflx";
+    case NICE_CANDIDATE_TYPE_PEER_REFLEXIVE:
+        return "prflx";
+    case NICE_CANDIDATE_TYPE_RELAYED:
+        return "relay";
+    default:
+        return "unknown";
+    }
+}
+
+static void on_new_candidate_cb(NiceAgent *, guint, guint, NiceCandidate *c,
+                                gpointer user_data) {
+    auto *state = static_cast<TurnProbeState *>(user_data);
+    if (!nice_address_is_valid(&c->addr)) {
+        std::cout << "[TURN probe] candidate " << candidate_type_str(c->type)
+                  << " (addr invalid)\n";
+        return;
+    }
+    char ip[64] = {0};
+    nice_address_to_string(&c->addr, ip);
+    uint16_t port = nice_address_get_port(&c->addr);
+    std::cout << "[TURN probe] candidate " << candidate_type_str(c->type) << " "
+              << ip << ":" << port << "\n";
+    if (state && c->type == NICE_CANDIDATE_TYPE_RELAYED) {
+        state->relayCount.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // ---------- AEAD (AES-256-GCM) ----------
@@ -232,6 +533,32 @@ struct AudioConfig {
 // ---------- основное состояние приложения ----------
 
 struct App {
+    // paths/config
+    std::string execDir;
+
+    // auth/secrets
+    bool authenticated{false};
+    std::string authUser;
+    std::string authError;
+    std::string remoteUser;
+    uint16_t localPortOverride{0};
+    std::string localBindIp{"0.0.0.0"};
+    std::string authToken;
+    EVP_PKEY *serverPubKey{nullptr};
+
+    // STUN/TURN
+    std::string stunServer{"127.0.0.1"};
+    uint16_t stunPort{3478};
+    std::string turnRealm{"local"};
+    std::string turnUser;
+    std::string turnPassword;
+    std::string stunStatus;
+    bool forceTurnOnly{false};
+
+    // signalling
+    std::string sigServer{"http://127.0.0.1:7777"};
+    std::string sigStatus;
+
     // audio
     AudioConfig cfg{};
     ma_context ctx{};
@@ -286,6 +613,451 @@ struct App {
     }
 
     void clearError() { lastError.clear(); }
+
+    bool authenticateUser(const std::string &user, const std::string &pwd) {
+        // В этой версии логины/пароли проверяет signalling/turn, здесь просто
+        // сохраняем
+        authenticated = true;
+        authUser = user;
+        turnUser = user;
+        turnPassword = pwd;
+        authError.clear();
+        // Привязываем порт детерминированно по user
+        localPortOverride = default_port_for_user(user);
+        localBindIp = "0.0.0.0";
+        stunStatus.clear();
+        return true;
+    }
+
+    bool parseSigServer(std::string &host, uint16_t &port) {
+        if (!parse_host_port_url(sigServer, host, port)) {
+            sigStatus = "Bad signalling URL";
+            return false;
+        }
+        return true;
+    }
+
+    bool fetchServerPubKey() {
+        std::string host;
+        uint16_t port = 0;
+        if (!parseSigServer(host, port))
+            return false;
+        sockaddr_in sa{};
+        if (!resolve_ipv4(host, port, sa)) {
+            sigStatus = "Signalling host resolve failed";
+            return false;
+        }
+        std::string resp;
+        if (!tcp_send_recv_line(sa, "GETPUB", resp, 2000)) {
+            sigStatus = "Signalling GETPUB timeout";
+            return false;
+        }
+        if (resp.rfind("PUB ", 0) != 0) {
+            sigStatus = "GETPUB bad response";
+            return false;
+        }
+        std::string b64 = resp.substr(4);
+        std::vector<uint8_t> der;
+        if (!b64_decode(b64, der)) {
+            sigStatus = "GETPUB b64 decode failed";
+            return false;
+        }
+        EVP_PKEY *pk = pubkey_from_der(der.data(), der.size());
+        if (!pk) {
+            sigStatus = "GETPUB parse failed";
+            return false;
+        }
+        if (serverPubKey)
+            EVP_PKEY_free(serverPubKey);
+        serverPubKey = pk;
+        std::cout << "[sig] GOT server pubkey, bytes=" << der.size() << "\n";
+        return true;
+    }
+
+    bool loginWithSignalling(const std::string &user,
+                             const std::string &password) {
+        if (!initRSA()) {
+            authError = "RSA init failed";
+            return false;
+        }
+        if (!fetchServerPubKey()) {
+            authError = sigStatus;
+            return false;
+        }
+
+        std::vector<uint8_t> clientDer;
+        if (!pubkey_to_der(rsaKey, clientDer)) {
+            authError = "Client pubkey DER failed";
+            return false;
+        }
+        std::string clientB64 = b64_encode(clientDer.data(), clientDer.size());
+        std::cout << "[sig] Client pub DER size=" << clientDer.size()
+                  << ", b64 len=" << clientB64.size() << "\n";
+
+        std::string plain = user + ":" + password;
+        std::vector<uint8_t> cipher;
+        if (!rsa_encrypt(serverPubKey,
+                         std::span<const uint8_t>(
+                             reinterpret_cast<const uint8_t *>(plain.data()),
+                             plain.size()),
+                         cipher)) {
+            authError = "Encrypt creds failed";
+            return false;
+        }
+        std::string cipherB64 = b64_encode(cipher.data(), cipher.size());
+        std::cout << "[sig] Encrypted creds bytes=" << cipher.size()
+                  << ", b64 len=" << cipherB64.size() << "\n";
+
+        std::string host;
+        uint16_t port = 0;
+        if (!parseSigServer(host, port))
+            return false;
+        sockaddr_in sa{};
+        if (!resolve_ipv4(host, port, sa)) {
+            authError = "Signalling host resolve failed";
+            return false;
+        }
+        std::stringstream line;
+        line << "AUTH " << clientB64 << " " << cipherB64;
+        std::string resp;
+        if (!tcp_send_recv_line(sa, line.str(), resp, 3000)) {
+            authError = "Signalling auth timeout";
+            return false;
+        }
+        std::cout << "[sig] AUTH response: " << resp << "\n";
+        if (resp.rfind("OK ", 0) != 0) {
+            authError = "Auth failed: " + resp;
+            return false;
+        }
+        std::string tokenB64 = trim(resp.substr(3));
+        std::vector<uint8_t> tokenCipher;
+        if (!b64_decode(tokenB64, tokenCipher)) {
+            authError = "Token b64 decode failed";
+            return false;
+        }
+        std::cout << "[sig] Token cipher bytes=" << tokenCipher.size() << "\n";
+        std::vector<uint8_t> tokenPlain;
+        if (!rsa_decrypt(rsaKey, tokenCipher, tokenPlain)) {
+            authError = "Token decrypt failed";
+            return false;
+        }
+        authToken.assign(reinterpret_cast<char *>(tokenPlain.data()),
+                         tokenPlain.size());
+        std::cout << "[sig] Auth OK, token len=" << authToken.size() << "\n";
+
+        authenticated = true;
+        authUser = user;
+        turnUser = user;
+        turnPassword = password;
+        authError.clear();
+        sigStatus = "Auth OK";
+        localPortOverride = default_port_for_user(user);
+        localBindIp = "0.0.0.0";
+        stunStatus.clear();
+        return true;
+    }
+
+    bool signallingRegisterSelf() {
+        if (authToken.empty()) {
+            sigStatus = "No auth token";
+            return false;
+        }
+        std::string host;
+        uint16_t port = 0;
+        if (!parseSigServer(host, port))
+            return false;
+        sockaddr_in sa{};
+        if (!resolve_ipv4(host, port, sa)) {
+            sigStatus = "Signalling host resolve failed";
+            return false;
+        }
+        std::stringstream line;
+        line << "REGISTER " << authToken << " " << localBindIp << " "
+             << localPortOverride;
+        std::string resp;
+        if (!tcp_send_recv_line(sa, line.str(), resp, 2000)) {
+            sigStatus = "Signalling register timeout";
+            return false;
+        }
+        std::cout << "[sig] REGISTER resp: " << resp << "\n";
+        if (resp.rfind("OK", 0) == 0) {
+            sigStatus = "Registered at signalling";
+            return true;
+        }
+        sigStatus = "Register failed: " + resp;
+        return false;
+    }
+
+    bool signallingQueryPeer(const std::string &peer, std::string &ipOut,
+                             uint16_t &portOut) {
+        if (authToken.empty()) {
+            sigStatus = "No auth token";
+            return false;
+        }
+        std::string host;
+        uint16_t port = 0;
+        if (!parseSigServer(host, port))
+            return false;
+        sockaddr_in sa{};
+        if (!resolve_ipv4(host, port, sa)) {
+            sigStatus = "Signalling host resolve failed";
+            return false;
+        }
+        std::stringstream line;
+        line << "QUERY " << authToken << " " << peer;
+        std::string resp;
+        if (!tcp_send_recv_line(sa, line.str(), resp, 2000)) {
+            sigStatus = "Signalling query timeout";
+            return false;
+        }
+        std::cout << "[sig] QUERY resp: " << resp << "\n";
+        if (resp.rfind("OK ", 0) == 0) {
+            std::istringstream iss(resp.substr(3));
+            std::string ip;
+            uint16_t p = 0;
+            iss >> ip >> p;
+            if (ip.empty() || p == 0) {
+                sigStatus = "Signalling response invalid";
+                return false;
+            }
+            ipOut = ip;
+            portOut = p;
+            sigStatus = "Peer address received";
+            return true;
+        }
+        sigStatus = "Peer not found: " + resp;
+        return false;
+    }
+
+    // --- Простая TURN-ALLOCATE проверка (UDP, без ICE/libnice) ---
+    struct StunAttr {
+        uint16_t type;
+        uint16_t len;
+        std::vector<uint8_t> data;
+    };
+
+    static uint32_t crc32(const uint8_t *data, size_t len) {
+        uint32_t crc = 0xFFFFFFFF;
+        for (size_t i = 0; i < len; ++i) {
+            crc ^= data[i];
+            for (int j = 0; j < 8; ++j) {
+                uint32_t mask = -(crc & 1u);
+                crc = (crc >> 1) ^ (0xEDB88320 & mask);
+            }
+        }
+        return ~crc;
+    }
+
+    static void add_attr(std::vector<uint8_t> &buf, uint16_t type,
+                         std::span<const uint8_t> data) {
+        uint16_t len = (uint16_t)data.size();
+        uint16_t t_be = htons(type);
+        uint16_t l_be = htons(len);
+        buf.insert(buf.end(), reinterpret_cast<uint8_t *>(&t_be),
+                   reinterpret_cast<uint8_t *>(&t_be) + 2);
+        buf.insert(buf.end(), reinterpret_cast<uint8_t *>(&l_be),
+                   reinterpret_cast<uint8_t *>(&l_be) + 2);
+        buf.insert(buf.end(), data.begin(), data.end());
+        // padding to 4 bytes
+        size_t pad = (4 - (len % 4)) % 4;
+        for (size_t i = 0; i < pad; ++i)
+            buf.push_back(0);
+    }
+
+    static bool parse_attr(const uint8_t *buf, size_t len, uint16_t &typeOut,
+                           std::span<const uint8_t> &dataOut, size_t &consumed) {
+        if (len < 4)
+            return false;
+        typeOut = ntohs(*reinterpret_cast<const uint16_t *>(buf));
+        uint16_t l = ntohs(*reinterpret_cast<const uint16_t *>(buf + 2));
+        if (len < 4 + l)
+            return false;
+        dataOut = {buf + 4, l};
+        consumed = 4 + ((l + 3) & ~3u);
+        return true;
+    }
+
+    static void stun_set_length(std::vector<uint8_t> &buf) {
+        uint16_t beLen = htons((uint16_t)(buf.size() - 20));
+        std::memcpy(buf.data() + 2, &beLen, 2);
+    }
+
+    static void stun_add_fingerprint(std::vector<uint8_t> &buf) {
+        stun_set_length(buf);
+        uint32_t crc = crc32(buf.data(), buf.size());
+        crc ^= 0x5354554E;
+        uint32_t be = htonl(crc);
+        add_attr(buf, 0x8028,
+                 {reinterpret_cast<uint8_t *>(&be),
+                  reinterpret_cast<uint8_t *>(&be) + 4});
+        stun_set_length(buf);
+    }
+
+    static bool parse_xor_addr(std::span<const uint8_t> data,
+                               const std::array<uint8_t, 12> &tid,
+                               std::string &ip, uint16_t &port) {
+        if (data.size() < 8)
+            return false;
+        uint8_t family = data[1];
+        uint16_t p = ntohs(*reinterpret_cast<const uint16_t *>(data.data() + 2));
+        uint32_t cookie = 0x2112A442;
+        p ^= (uint16_t)(cookie >> 16);
+        port = p;
+        if (family == 0x01 && data.size() >= 8) {
+            uint32_t addr =
+                ntohl(*reinterpret_cast<const uint32_t *>(data.data() + 4));
+            addr ^= cookie;
+            in_addr ina{};
+            ina.s_addr = htonl(addr);
+            char buf[32];
+            if (!inet_ntop(AF_INET, &ina, buf, sizeof(buf)))
+                return false;
+            ip = buf;
+            return true;
+        }
+        if (family == 0x02 && data.size() >= 20) {
+            std::array<uint8_t, 16> v6{};
+            std::memcpy(v6.data(), data.data() + 4, 16);
+            for (int i = 0; i < 4; ++i)
+                v6[i] ^= (uint8_t)((cookie >> (24 - i * 8)) & 0xFF);
+            for (int i = 0; i < 12; ++i)
+                v6[4 + i] ^= tid[i];
+            char buf[64];
+            if (!inet_ntop(AF_INET6, v6.data(), buf, sizeof(buf)))
+                return false;
+            ip = buf;
+            return true;
+        }
+        return false;
+    }
+
+    bool probeTurnOnce(std::string &relayInfoOut) {
+        relayInfoOut.clear();
+        if (turnUser.empty() || turnPassword.empty()) {
+            lastError = "TURN user/password are empty";
+            return false;
+        }
+        nice_debug_enable(TRUE);
+        GMainContext *ctx = g_main_context_new();
+        if (!ctx) {
+            lastError = "g_main_context_new failed";
+            return false;
+        }
+        g_main_context_push_thread_default(ctx);
+
+        NiceAgent *agent = nice_agent_new(ctx, NICE_COMPATIBILITY_RFC5245);
+        if (!agent) {
+            g_main_context_pop_thread_default(ctx);
+            g_main_context_unref(ctx);
+            lastError = "nice_agent_new failed";
+            return false;
+        }
+
+        // только UDP, без ICE-TCP/IPv6 — полагаемся на add_local_address(127.0.0.1)
+        g_object_set(G_OBJECT(agent), "ice-tcp", FALSE, nullptr);
+        g_object_set(G_OBJECT(agent), "upnp", FALSE, nullptr);
+        // full-mode конструкторный — не трогаем, оставляем по умолчанию
+
+        g_object_set(G_OBJECT(agent), "stun-server", stunServer.c_str(),
+                     "stun-server-port", (guint)stunPort, nullptr);
+
+        // Явно добавляем loopback-адрес, иначе libnice его игнорирует и STUN на
+        // 127.0.0.1 не работает
+        NiceAddress lo{};
+        nice_address_init(&lo);
+        nice_address_set_from_string(&lo, "127.0.0.1");
+        nice_agent_add_local_address(agent, &lo);
+
+        guint stream = nice_agent_add_stream(agent, 1);
+        if (stream == 0) {
+            g_object_unref(agent);
+            g_main_context_pop_thread_default(ctx);
+            g_main_context_unref(ctx);
+            lastError = "nice_agent_add_stream failed";
+            return false;
+        }
+
+        gboolean ok = nice_agent_set_relay_info(
+            agent, stream, 1, stunServer.c_str(), stunPort, turnUser.c_str(),
+            turnPassword.c_str(), NICE_RELAY_TYPE_TURN_UDP);
+        if (!ok) {
+            g_object_unref(agent);
+            g_main_context_pop_thread_default(ctx);
+            g_main_context_unref(ctx);
+            lastError = "nice_agent_set_relay_info failed";
+            return false;
+        }
+
+        TurnProbeState state;
+        state.loop = g_main_loop_new(ctx, FALSE);
+        g_signal_connect(agent, "new-candidate-full",
+                         G_CALLBACK(on_new_candidate_cb), &state);
+        g_signal_connect(agent, "candidate-gathering-done",
+                         G_CALLBACK(on_candidates_gathered_cb), &state);
+
+        if (!nice_agent_gather_candidates(agent, stream)) {
+            g_object_unref(agent);
+            g_main_context_pop_thread_default(ctx);
+            g_main_context_unref(ctx);
+            lastError = "nice_agent_gather_candidates failed";
+            return false;
+        }
+
+        auto timeout_cb = [](gpointer data) -> gboolean {
+            auto *st = static_cast<TurnProbeState *>(data);
+            st->timedOut.store(true, std::memory_order_relaxed);
+            if (st->loop)
+                g_main_loop_quit(st->loop);
+            return G_SOURCE_REMOVE;
+        };
+        GSource *timeoutSource = g_timeout_source_new(4000);
+        g_source_set_callback(timeoutSource, timeout_cb, &state, nullptr);
+        g_source_attach(timeoutSource, ctx);
+        state.timeout = timeoutSource;
+
+        g_main_loop_run(state.loop);
+
+        bool success = state.done.load(std::memory_order_relaxed);
+        bool timedOut = state.timedOut.load(std::memory_order_relaxed);
+        bool haveRelay = false;
+        std::stringstream relay;
+        if (success) {
+            GSList *cands = nice_agent_get_local_candidates(agent, stream, 1);
+            for (GSList *l = cands; l != nullptr; l = l->next) {
+                NiceCandidate *c = static_cast<NiceCandidate *>(l->data);
+                char ip[64] = {0};
+                nice_address_to_string(&c->addr, ip);
+                if (c->type == NICE_CANDIDATE_TYPE_RELAYED) {
+                    relay << ip << ":" << nice_address_get_port(&c->addr);
+                    haveRelay = true;
+                }
+                nice_candidate_free(c);
+            }
+            g_slist_free(cands);
+        }
+
+        g_object_unref(agent);
+        if (state.loop)
+            g_main_loop_unref(state.loop);
+        if (state.timeout) {
+            g_source_destroy(state.timeout);
+            g_source_unref(state.timeout);
+        }
+        g_main_context_pop_thread_default(ctx);
+        g_main_context_unref(ctx);
+
+        if (!success) {
+            lastError = timedOut ? "TURN/STUN gather timed out"
+                                 : "TURN/STUN gather failed";
+            return false;
+        }
+        if (!haveRelay) {
+            lastError = "TURN relay not allocated (check credentials)";
+            return false;
+        }
+        relayInfoOut = relay.str();
+        return true;
+    }
 
     // --------- RSA ключ ---------
     bool initRSA() {
@@ -570,14 +1342,14 @@ struct App {
         if (pem.empty())
             return;
 
-        std::vector<uint8_t> pkt(1 + pem.size());
-        pkt[0] = static_cast<uint8_t>(PacketType::CTRL_PUBKEY);
-        std::memcpy(pkt.data() + 1, pem.data(), pem.size());
+    std::vector<uint8_t> pkt(1 + pem.size());
+    pkt[0] = static_cast<uint8_t>(PacketType::CTRL_PUBKEY);
+    std::memcpy(pkt.data() + 1, pem.data(), pem.size());
 
-        ::sendto(sockfd, pkt.data(), (int)pkt.size(), 0,
-                 (sockaddr *)&remoteAddr, sizeof(remoteAddr));
-        pubkeySent = true;
-    }
+    ::sendto(sockfd, pkt.data(), (int)pkt.size(), 0,
+             (sockaddr *)&remoteAddr, sizeof(remoteAddr));
+    pubkeySent = true;
+}
 
     void recvLoop() {
         std::vector<uint8_t> buf(2048);
@@ -725,7 +1497,7 @@ struct App {
         }
         rbInitialized = true;
 
-        // ВАЖНО: стартуем девайс один раз здесь
+        // Стартуем девайс один раз здесь
         if (ma_device_start(&dev) != MA_SUCCESS) {
             lastError = "ma_device_start failed in open()";
             ma_device_uninit(&dev);
@@ -735,6 +1507,7 @@ struct App {
         }
 
         running.store(true);
+        capturing.store(false);
         return true;
     }
 
@@ -1156,16 +1929,23 @@ int main(int argc, char *argv[]) {
     App app;
     app.initRSA();
 
+    std::filesystem::path exePath = std::filesystem::absolute(argv[0]);
+    app.execDir = exePath.parent_path().string();
+    // secrets/users.txt больше не используем; логины/пароли проверяются на signalling/TURN
+
     bool quit = false;
     bool showDemo = false;
 
-    static char localIpBuf[64] = "127.0.0.1";
-    static char remoteIpBuf[64] = "127.0.0.1";
-    static int localPort = 5004;
-    static int remotePort = 5005;
-    if (argc > 2) {
-        localPort = std::stoi(argv[1]);
-        remotePort = std::stoi(argv[2]);
+    static char loginUser[64] = "";
+    static char loginPass[64] = "";
+    static char remoteUserBuf[64] = "";
+    static char turnHostBuf[128] = "";
+    static bool cfgInit = false;
+    int stunPortUI = (int)app.stunPort;
+    if (!cfgInit) {
+        std::snprintf(turnHostBuf, sizeof(turnHostBuf), "%s",
+                      app.stunServer.c_str());
+        cfgInit = true;
     }
 
     while (!quit) {
@@ -1200,11 +1980,129 @@ int main(int argc, char *argv[]) {
             ImGuiWindowFlags_NoBringToFrontOnFocus);
         // clang-format on
 
+        ImGui::Text("Auth & Signalling");
+
+        if (!app.authenticated) {
+            ImGui::InputText("Username", loginUser, sizeof(loginUser));
+            ImGui::InputText("Password", loginPass, sizeof(loginPass),
+                             ImGuiInputTextFlags_Password);
+            if (ImGui::Button("Login")) {
+                std::string u = trim(loginUser);
+                std::string p = std::string(loginPass);
+                app.loginWithSignalling(u, p);
+            }
+            if (!app.authError.empty()) {
+                ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
+                                   "Auth error: %s", app.authError.c_str());
+            }
+        } else {
+            ImGui::Text("Logged in as %s", app.authUser.c_str());
+            ImGui::SameLine();
+            if (ImGui::Button("Logout")) {
+                app.stopNetwork();
+                app.remoteUser.clear();
+                app.authenticated = false;
+                app.authUser.clear();
+                app.turnUser.clear();
+                app.turnPassword.clear();
+            }
+            ImGui::Text("Bind IP/port: %s:%u", app.localBindIp.c_str(),
+                        (unsigned)app.localPortOverride);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("TURN/STUN server");
+
+        if (ImGui::InputText("STUN/TURN host", turnHostBuf,
+                             sizeof(turnHostBuf))) {
+            app.stunServer = turnHostBuf;
+        }
+        if (ImGui::InputInt("STUN/TURN port", &stunPortUI)) {
+            if (stunPortUI < 1)
+                stunPortUI = 1;
+            if (stunPortUI > 65535)
+                stunPortUI = 65535;
+            app.stunPort = (uint16_t)stunPortUI;
+        }
+        ImGui::Checkbox("Use only TURN (no host/STUN fallback)",
+                        &app.forceTurnOnly);
+
+        ImGui::Separator();
+        ImGui::Text("Signalling server (register & fetch peer address)");
+        static char sigUrlBuf[256] = "http://127.0.0.1:7777";
+        ImGui::InputText("Signalling URL", sigUrlBuf, sizeof(sigUrlBuf));
+        app.sigServer = sigUrlBuf;
+        if (!app.sigStatus.empty()) {
+            ImGui::Text("Signalling: %s", app.sigStatus.c_str());
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Call (remote username)");
+        ImGui::InputText("Remote username", remoteUserBuf,
+                         sizeof(remoteUserBuf));
+
+        if (!app.netRunning.load()) {
+            if (ImGui::Button("Call user")) {
+                std::string remoteName = trim(remoteUserBuf);
+                std::string rip;
+                uint16_t rport = 0;
+                if (remoteName.empty()) {
+                    app.lastError = "Remote username is empty";
+                } else if (!app.authenticated) {
+                    app.lastError = "Login first";
+                } else {
+                    bool gotPeer = false;
+                    if (!app.signallingRegisterSelf()) {
+                        app.lastError = app.sigStatus;
+                    } else if (app.signallingQueryPeer(remoteName, rip, rport)) {
+                        gotPeer = true;
+                        app.lastError.clear();
+                    } else {
+                        app.lastError = "Peer address not found (signalling)";
+                    }
+
+                    if (gotPeer) {
+                        if (!app.startNetwork(app.localBindIp,
+                                              app.localPortOverride, rip,
+                                              rport)) {
+                            app.lastError = "Network start failed";
+                        } else {
+                            app.remoteUser = remoteName;
+                            app.lastError.clear();
+                        }
+                    }
+                }
+            }
+        } else {
+            if (ImGui::Button("Hang up")) {
+                app.stopNetwork();
+                app.remoteUser.clear();
+            }
+        }
+
+        ImGui::Text("Device:   %s", app.running.load() ? "open" : "closed");
+        ImGui::Text("Capture:  %s", app.capturing.load() ? "on" : "off");
+        ImGui::Text("Network:  %s", app.netRunning.load() ? "on" : "off");
+        if (!app.remoteUser.empty())
+            ImGui::Text("Remote peer: %s", app.remoteUser.c_str());
+
+        ImGui::Separator();
         ImGui::Text("Audio: %d Hz, %d ch, %d ms", app.cfg.sampleRate,
                     app.cfg.channels, app.cfg.frameMs);
-        ImGui::Separator();
+        // Audio device
+        if (!app.running.load()) {
+            if (ImGui::Button("Open device")) {
+                if (!app.open()) {
+                    ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Open failed");
+                }
+            }
+        } else {
+            if (ImGui::Button("Close device")) {
+                app.close();
+            }
+        }
 
-        // Mic
+        // Mic toggle
         ImGui::Text("Mic:");
         ImGui::SameLine();
         if (MicButton("mic_btn", app.capturing.load())) {
@@ -1220,19 +2118,6 @@ int main(int argc, char *argv[]) {
         ImGui::SameLine();
         ImGui::Text("%s", app.capturing.load() ? "ON" : "OFF");
 
-        // Audio device
-        if (!app.running.load()) {
-            if (ImGui::Button("Open device")) {
-                if (!app.open()) {
-                    ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "Open failed");
-                }
-            }
-        } else {
-            if (ImGui::Button("Close device")) {
-                app.close();
-            }
-        }
-
         // Ключи
         if (ImGui::Button("Rotate session key (TX)")) {
             if (!app.rotateOutgoingKey(true)) {
@@ -1243,35 +2128,6 @@ int main(int argc, char *argv[]) {
         ImGui::SameLine();
         ImGui::Text("TX key: %s, RX key: %s", app.txKeyValid ? "OK" : "none",
                     app.rxKeyValid ? "OK" : "none");
-
-        ImGui::Separator();
-        ImGui::Text("Network (RTP/UDP + AES-GCM + RSA key update)");
-
-        ImGui::InputText("Local IP (empty = 0.0.0.0)", localIpBuf,
-                         sizeof(localIpBuf));
-        ImGui::InputInt("Local port", &localPort);
-        ImGui::InputText("Remote IP", remoteIpBuf, sizeof(remoteIpBuf));
-        ImGui::InputInt("Remote port", &remotePort);
-
-        if (!app.netRunning.load()) {
-            if (ImGui::Button("Start network")) {
-                std::string localIp = localIpBuf;
-                std::string remoteIp = remoteIpBuf;
-                if (!app.startNetwork(localIp, (uint16_t)localPort, remoteIp,
-                                      (uint16_t)remotePort)) {
-                    ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
-                                       "Network start failed");
-                }
-            }
-        } else {
-            if (ImGui::Button("Stop network")) {
-                app.stopNetwork();
-            }
-        }
-
-        ImGui::Text("Device:   %s", app.running.load() ? "open" : "closed");
-        ImGui::Text("Capture:  %s", app.capturing.load() ? "on" : "off");
-        ImGui::Text("Network:  %s", app.netRunning.load() ? "on" : "off");
 
         ImGui::Separator();
 

@@ -18,6 +18,8 @@ class ZvonilkaDeps(ConanFile):
         self.requires("imgui/1.92.2b-docking")
         self.requires("sdl/3.2.20")
         self.requires("opus/1.5.2")
+        self.requires("libnice/0.1.21")
+        self.requires("libffi/3.4.4")
 
     def layout(self):
         cmake_layout(self)
