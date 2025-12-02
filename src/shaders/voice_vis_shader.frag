@@ -1,14 +1,19 @@
-#version 330 core
+#version 300 es
+
+#ifdef GL_ES
+precision mediump float;
+#endif
+
 in vec2 uv;
 out vec4 fragColor;
 
-uniform float level;
-uniform float time;
+uniform float u_level;
+uniform float u_time;
 
 vec4 ColorOrbWave(vec4 col1, vec4 col2, float coef) {
-    float sine1 = sin(2. * coef * atan(uv.y / uv.x) + time * coef);
-    float sine2 = sin(4. * coef * atan(uv.y / uv.x) + time * coef);
-    float wave = 0.4 + 0.2 * (coef * level + coef * level * sine1 * sine2);
+    float sine1 = sin(2. * coef * atan(uv.y / uv.x) + u_time * coef);
+    float sine2 = sin(4. * coef * atan(uv.y / uv.x) + u_time * coef);
+    float wave = 0.4 + 0.2 * (coef * u_level + coef * u_level * sine1 * sine2);
 
     float thickness = 0.01;
     float bloor = 0.1;
@@ -32,7 +37,7 @@ void main() {
     vec4 result = vec4(0);
     int count = 4;
     for(int i = 0; i < count; ++i) {
-        result += ColorOrbWave(col1, col2, i) / count;
+        result += ColorOrbWave(col1, col2, float(i)) / float(count);
     }
 
     fragColor = result;

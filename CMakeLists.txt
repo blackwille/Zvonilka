@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(DEPENDENCIES_DIR ${CMAKE_SOURCE_DIR}/dependencies)
 
+find_package(spdlog REQUIRED)
 find_package(imgui REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(SDL3 REQUIRED)
@@ -26,6 +27,7 @@ add_executable(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
+    spdlog::spdlog
     imgui::imgui
     OpenSSL::SSL
     OpenSSL::Crypto

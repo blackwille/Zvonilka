@@ -14,6 +14,7 @@ class ZvonilkaDeps(ConanFile):
     def requirements(self):
         if self.requires is None:
             return
+        self.requires("spdlog/1.16.0")
         self.requires("miniaudio/0.11.22")
         self.requires("imgui/1.92.2b-docking")
         self.requires("sdl/3.2.20")
