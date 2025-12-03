@@ -7,5 +7,5 @@ Diagnostics:
   UnusedIncludes: Strict
   ClangTidy:
     Add: [ bugprone-*, cert-*, modernize-*, performance-*, cppcoreguidelines-* ]
-    Remove: [ bugprone-easily-swappable-parameters, modernize-use-trailing-return-type ]
+    Remove: [ bugprone-easily-swappable-parameters, modernize-use-trailing-return-type, cppcoreguidelines-pro-bounds-pointer-arithmetic ]
 ...

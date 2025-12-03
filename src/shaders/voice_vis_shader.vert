@@ -5,5 +5,5 @@ out vec2 uv;
 
 void main() {
     uv = pos;
-    gl_Position = vec4(pos, 0.0, 1.0);
+    gl_Position = vec4(pos, 0.0f, 1.0f);
 }

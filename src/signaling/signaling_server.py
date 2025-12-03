@@ -5,7 +5,6 @@
 Фичи:
   * RSA-аутентификация, токены.
   * Пользователи и их пароли зашиты в коде (USERS).
-  * REGISTER / QUERY для выдачи IP:port по имени.
   * Хранение публичных ключей клиента (DER, SubjectPublicKeyInfo).
   * PUBKEY: выдача публичного ключа любого пользователя.
   * KEY_PUSH / KEY_POLL: буфер обмена RSA-зашифрованными AES-ключами
@@ -20,15 +19,9 @@
 
   AUTH <b64_der_client_pub> <b64_cipher(creds)>
     creds = "user:pass" (UTF-8), зашифрованы серверным ключом
-           (RSA OAEP SHA256)
+           (RSA OAEP SHA512)
     <- OK <b64_cipher(token)>
        token шифруется клиентским pub
-
-  REGISTER <token> <ip> <port>
-    -> OK | ERR auth | ERR badport
-
-  QUERY <token> <user>
-    -> OK <ip> <port> | ERR notfound | ERR auth
 
   PUBKEY <token> <user>
     -> OK <b64_der_client_pub> | ERR notfound | ERR auth
@@ -64,9 +57,6 @@ USERS: dict[str, str] = {
     "user1": "pass123",
     "user2": "pass123",
 }
-
-# user -> (ip, port)
-REGISTRY: dict[str, tuple[str, int]] = {}
 
 # token -> (user, client_pubkey)
 TOKENS: dict[str, tuple[str, PublicKeyTypes]] = {}
@@ -136,8 +126,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     plain = SERVER_KEY.decrypt(
                         cipher,
                         padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
+                            mgf=padding.MGF1(algorithm=hashes.SHA512()),
+                            algorithm=hashes.SHA512(),
                             label=None,
                         ),
                     )
@@ -158,8 +148,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     cipher_token = client_pub.encrypt(
                         token.encode("ascii"),
                         padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
+                            mgf=padding.MGF1(algorithm=hashes.SHA512()),
+                            algorithm=hashes.SHA512(),
                             label=None,
                         ),
                     )
@@ -172,8 +162,6 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
             # --- от этой точки все команды требуют валидного token ---
             if cmd in {
-                "REGISTER",
-                "QUERY",
                 "PUBKEY",
                 "KEY_PUSH",
                 "KEY_POLL",
@@ -194,35 +182,6 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     await writer.drain()
                     continue
                 user, client_pub = TOKENS[token]
-
-                # --- REGISTER ---
-                if cmd == "REGISTER" and len(parts) == 4:
-                    ip, port_s = parts[2], parts[3]
-                    try:
-                        port = int(port_s)
-                    except ValueError:
-                        print("[sig] REGISTER bad port")
-                        writer.write(b"ERR badport\n")
-                        await writer.drain()
-                        continue
-                    REGISTRY[user] = (ip, port)
-                    print(f"[sig] REGISTER ok user={user} {ip}:{port}")
-                    writer.write(b"OK\n")
-                    await writer.drain()
-                    continue
-
-                # --- QUERY ---
-                if cmd == "QUERY" and len(parts) == 3:
-                    target = parts[2]
-                    if target in REGISTRY:
-                        ip, port = REGISTRY[target]
-                        print(f"[sig] QUERY hit {target} -> {ip}:{port}")
-                        writer.write(f"OK {ip} {port}\n".encode())
-                    else:
-                        print(f"[sig] QUERY miss {target}")
-                        writer.write(b"ERR notfound\n")
-                    await writer.drain()
-                    continue
 
                 # --- PUBKEY ---
                 if cmd == "PUBKEY" and len(parts) == 3:

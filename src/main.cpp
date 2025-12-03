@@ -25,8 +25,6 @@
 //  * Сигналинг (signaling_server.py):
 //      - GETPUB: получить RSA pub сервера.
 //      - AUTH: RSA-авторизация по login/pass, токен.
-//      - REGISTER: зарегистрировать IP:port пользователя.
-//      - QUERY: получить IP:port другого пользователя по имени.
 //      - PUBKEY: получить публичный ключ другого пользователя.
 //      - KEY_PUSH / KEY_POLL: обмен зашифрованными AES-ключами.
 //      - ICE_OFFER / ICE_POLL_OFFER / ICE_ANSWER / ICE_POLL_ANSWER:
@@ -37,7 +35,6 @@
 //
 //  * UI (ImGui):
 //      - Авторизация на сигналинге.
-//      - REG/QUERY по имени.
 //      - Настройки STUN/TURN, флаг Force TURN only.
 //      - Кнопки:
 //          * Мут микрофона.
@@ -57,6 +54,7 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_opengl.h>
 #include <SDL3/SDL_video.h>
+#include <nice/candidate.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -76,7 +74,9 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <list>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -191,7 +191,7 @@ public:
 
     EVP_PKEY* get() const { return pkey_; }
 
-    bool generate(int bits = 2048) {
+    bool generate(int bits = 4096) {
         if (pkey_) {
             EVP_PKEY_free(pkey_);
             pkey_ = nullptr;
@@ -243,7 +243,7 @@ public:
         return B64Encode(buf);
     }
 
-    // RSA-OAEP + SHA256
+    // RSA-OAEP + SHA512
     bool decrypt(const std::vector<uint8_t>& cipher, std::vector<uint8_t>& plain) const {
         if (!pkey_) return false;
 
@@ -258,11 +258,11 @@ public:
             EVP_PKEY_CTX_free(ctx);
             return false;
         }
-        if (EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) <= 0) {
+        if (EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha512()) <= 0) {
             EVP_PKEY_CTX_free(ctx);
             return false;
         }
-        if (EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) <= 0) {
+        if (EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha512()) <= 0) {
             EVP_PKEY_CTX_free(ctx);
             return false;
         }
@@ -330,11 +330,11 @@ public:
             EVP_PKEY_CTX_free(ctx);
             return false;
         }
-        if (EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) <= 0) {
+        if (EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha512()) <= 0) {
             EVP_PKEY_CTX_free(ctx);
             return false;
         }
-        if (EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) <= 0) {
+        if (EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha512()) <= 0) {
             EVP_PKEY_CTX_free(ctx);
             return false;
         }
@@ -690,15 +690,19 @@ struct IceSession {
     bool forceTurn{false};
 
     bool gatheringDone{false};
-    bool haveLocalDesc{false};
     bool remoteSet{false};
     bool connected{false};
 
     std::string localUfrag;
     std::string localPwd;
-    std::string localIp;
-    uint16_t localPort{0};
-    std::string localType;
+
+    struct ICECandidate {
+        std::string ipStr{};
+        uint16_t port{};
+        NiceCandidateType type{};
+    };
+    std::list<ICECandidate> localICECandidates;
+    std::list<ICECandidate> remoteICECandidates;
 
     std::string remoteUfrag;
     std::string remotePwd;
@@ -716,7 +720,7 @@ struct IceSession {
         gchar* pw = nullptr;
         if (!nice_agent_get_local_credentials(agent, sid, &uf, &pw)) {
             self->lastError = "nice_agent_get_local_credentials failed";
-            self->gatheringDone = true;
+            self->gatheringDone = false;
             return;
         }
         self->localUfrag = uf ? uf : "";
@@ -725,44 +729,42 @@ struct IceSession {
         g_free(pw);
 
         GSList* cands = nice_agent_get_local_candidates(agent, sid, self->compId);
-        NiceCandidate* chosen = nullptr;
-        for (GSList* l = cands; l; l = l->next) {
-            NiceCandidate* c = static_cast<NiceCandidate*>(l->data);
-            if (!nice_address_is_valid(&c->addr)) continue;
+        std::set<uint16_t> alreadyHaveICETypes{};
+        for (GSList* node = cands; node; node = node->next) {
+            auto* candidate = static_cast<NiceCandidate*>(node->data);
+            if (!nice_address_is_valid(&candidate->addr)) {
+                continue;
+            }
             if (self->forceTurn) {
-                if (c->type == NICE_CANDIDATE_TYPE_RELAYED) {
-                    chosen = nice_candidate_copy(c);
-                    break;
-                }
-            } else {
-                // по умолчанию берем первый host/srflx, если есть;
-                // иначе relay
-                if (!chosen) {
-                    chosen = nice_candidate_copy(c);
-                    if (c->type == NICE_CANDIDATE_TYPE_HOST || c->type == NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE) {
-                        // ок, оставим именно его
-                    }
+                if (candidate->type != NICE_CANDIDATE_TYPE_RELAYED) {
+                    continue;
                 }
             }
+
+            if (alreadyHaveICETypes.contains(candidate->type)) {
+                continue;
+            }
+
+            char ip[64]{};
+            nice_address_to_string(&candidate->addr, static_cast<gchar*>(ip));
+            self->localICECandidates.emplace_back();
+            IceSession::ICECandidate& lastCandidate = self->localICECandidates.back();
+            lastCandidate.ipStr = ip;
+            lastCandidate.port = static_cast<uint16_t>(nice_address_get_port(&candidate->addr));
+            lastCandidate.type = candidate->type;
+
+            alreadyHaveICETypes.insert(lastCandidate.type);
         }
-        for (GSList* l = cands; l; l = l->next) nice_candidate_free((NiceCandidate*)l->data);
+        for (GSList* el = cands; el; el = el->next) nice_candidate_free((NiceCandidate*)el->data);
         g_slist_free(cands);
 
-        if (!chosen) {
+        if (self->localICECandidates.empty()) {
             self->lastError = "No suitable local ICE candidate";
-            self->gatheringDone = true;
+            self->gatheringDone = false;
             return;
         }
 
-        char ip[64] = {0};
-        nice_address_to_string(&chosen->addr, ip);
-        self->localIp = ip;
-        self->localPort = nice_address_get_port(&chosen->addr);
-        self->localType = candidate_type_str(chosen->type);
-
-        nice_candidate_free(chosen);
         self->gatheringDone = true;
-        self->haveLocalDesc = true;
     }
 
     static void cb_state_changed(NiceAgent* agent, guint sid, guint cid, guint state, gpointer user_data) {
@@ -854,10 +856,13 @@ struct IceSession {
     }
 
     bool buildLocalDescription(std::string& outDesc) const {
-        if (!haveLocalDesc) return false;
+        if (!gatheringDone) return false;
         // Формат: ufrag,pwd,ip,port,type
         std::ostringstream oss;
-        oss << localUfrag << "," << localPwd << "," << localIp << "," << localPort << "," << localType;
+        oss << localUfrag << ',' << localPwd << ',' << localICECandidates.size() << ':';
+        for (const IceSession::ICECandidate& cand : localICECandidates) {
+            oss << cand.ipStr << ',' << cand.port << ',' << cand.type << ';';
+        }
         outDesc = oss.str();
         return true;
     }
@@ -868,40 +873,60 @@ struct IceSession {
             return false;
         }
         std::istringstream iss(desc);
-        std::string ufrag, pwd, ip, portStr, typeStr;
-        if (!std::getline(iss, ufrag, ',')) return false;
-        if (!std::getline(iss, pwd, ',')) return false;
-        if (!std::getline(iss, ip, ',')) return false;
-        if (!std::getline(iss, portStr, ',')) return false;
-        if (!std::getline(iss, typeStr, ',')) return false;
+        std::string ufrag, pwd, candidatesCountStr;
+        if (!std::getline(iss, ufrag, ',')) {
+            return false;
+        }
+        if (!std::getline(iss, pwd, ',')) {
+            return false;
+        }
+        if (!std::getline(iss, candidatesCountStr, ':')) {
+            return false;
+        }
 
-        remoteUfrag = ufrag;
-        remotePwd = pwd;
+        uint16_t candidatesCount = std::stoi(candidatesCountStr);
+        remoteICECandidates.resize(candidatesCount);
+        for (IceSession::ICECandidate& cand : remoteICECandidates) {
+            std::string ipStr, portStr, typeStr;
+            if (!std::getline(iss, ipStr, ',')) {
+                return false;
+            }
+            cand.ipStr = ipStr;
+            if (!std::getline(iss, portStr, ',')) {
+                return false;
+            }
+            cand.port = std::stoi(portStr);
+            if (!std::getline(iss, typeStr, ';')) {
+                return false;
+            }
+            cand.type = static_cast<NiceCandidateType>(std::stoi(typeStr));
+        }
 
-        if (!nice_agent_set_remote_credentials(agent, streamId, remoteUfrag.c_str(), remotePwd.c_str())) {
+        if (!nice_agent_set_remote_credentials(agent, streamId, ufrag.c_str(), pwd.c_str())) {
             lastError = "nice_agent_set_remote_credentials failed";
             return false;
         }
 
-        int port = std::stoi(portStr);
-        NiceCandidateType ct = parse_candidate_type(typeStr);
+        GSList* cands = nullptr;
+        for (const IceSession::ICECandidate& cand : remoteICECandidates) {
+            NiceCandidate* cPtr = nice_candidate_new(cand.type);
+            cPtr->component_id = compId;
+            cPtr->stream_id = streamId;
+            cPtr->transport = NICE_CANDIDATE_TRANSPORT_UDP;
+            nice_address_init(&cPtr->addr);
+            nice_address_set_from_string(&cPtr->addr, cand.ipStr.c_str());
+            nice_address_set_port(&cPtr->addr, cand.port);
 
-        NiceCandidate* c = nice_candidate_new(ct);
-        c->component_id = compId;
-        c->stream_id = streamId;
-        c->transport = NICE_CANDIDATE_TRANSPORT_UDP;
-        nice_address_init(&c->addr);
-        nice_address_set_from_string(&c->addr, ip.c_str());
-        nice_address_set_port(&c->addr, port);
+            cands = g_slist_append(cands, cPtr);
+        }
 
-        GSList* lst = nullptr;
-        lst = g_slist_append(lst, c);
-        if (nice_agent_set_remote_candidates(agent, streamId, compId, lst) < 1) {
+        if (nice_agent_set_remote_candidates(agent, streamId, compId, cands) < 1) {
             lastError = "nice_agent_set_remote_candidates returned 0";
-            g_slist_free(lst);
+            for (GSList* l = cands; l; l = l->next) nice_candidate_free((NiceCandidate*)l->data);
+            g_slist_free(cands);
             return false;
         }
-        g_slist_free(lst);
+        g_slist_free(cands);
         remoteSet = true;
         return true;
     }
@@ -932,7 +957,6 @@ struct IceSession {
         recvQueue.clear();
         connected = false;
         gatheringDone = false;
-        haveLocalDesc = false;
         remoteSet = false;
     }
 };
@@ -1001,7 +1025,7 @@ public:
             return false;
         }
 
-        // Шифруем креды RSA-OAEP+SHA256
+        // Шифруем креды RSA-OAEP+SHA512
         std::vector<uint8_t> credCipher;
         if (!serverKey.encrypt(credBytes, credCipher)) {
             err = "RSA encrypt creds failed";
@@ -1033,55 +1057,6 @@ public:
         }
         token_ = std::string((char*)tokenPlain.data(), tokenPlain.size());
         return true;
-    }
-
-    bool registerSelf(const std::string& ip, uint16_t port, std::string& err) {
-        err.clear();
-        if (token_.empty()) {
-            err = "No auth token";
-            return false;
-        }
-        std::ostringstream line;
-        line << "REGISTER " << token_ << " " << ip << " " << port;
-        std::string resp;
-        if (!tcpSendRecv(line.str(), resp)) {
-            err = "REGISTER timeout";
-            return false;
-        }
-        if (resp != "OK") {
-            err = "REGISTER failed: " + resp;
-            return false;
-        }
-        return true;
-    }
-
-    bool queryUser(const std::string& user, std::string& outIp, uint16_t& outPort, std::string& err) {
-        err.clear();
-        if (token_.empty()) {
-            err = "No auth token";
-            return false;
-        }
-        std::ostringstream line;
-        line << "QUERY " << token_ << " " << user;
-        std::string resp;
-        if (!tcpSendRecv(line.str(), resp)) {
-            err = "QUERY timeout";
-            return false;
-        }
-        if (resp.starts_with("OK ")) {
-            std::istringstream iss(resp.substr(3));
-            std::string ip;
-            int port;
-            if (!(iss >> ip >> port)) {
-                err = "QUERY parse failed: " + resp;
-                return false;
-            }
-            outIp = ip;
-            outPort = (uint16_t)port;
-            return true;
-        }
-        err = "QUERY failed: " + resp;
-        return false;
     }
 
     bool getUserPubKey(const std::string& who, RsaPublicKey& out, std::string& err) {
@@ -1320,7 +1295,7 @@ private:
 
     std::vector<uint8_t> serverPubKeyDer_;
 
-    std::string host_{"127.0.0.1"};
+    std::string host_{"213.171.24.94"};
     uint16_t port_{7777};
     std::string user_;
     std::string pwd_;
@@ -1371,6 +1346,7 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
     static GLuint prog = 0;
     static GLint levelLoc = -1;
     static GLint timeLoc = -1;
+    static GLint aspectLoc = -1;
     static GLuint vao = 0;
     static GLuint vbo = 0;
 
@@ -1382,6 +1358,7 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
         prog = createProgram(kOrbVertCode, kOrbFragCode);
         levelLoc = glGetUniformLocation(prog, "u_level");
         timeLoc = glGetUniformLocation(prog, "u_time");
+        aspectLoc = glGetUniformLocation(prog, "u_aspect");
 
         float quadVerts[] = {-1.f, -1.f, 1.f, -1.f, 1.f,  1.f,
 
@@ -1400,32 +1377,30 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
         initialized = true;
     }
 
-    // Размер орба в окне (можно подогнать)
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    float size = std::min(avail.x, 300.0f);
-    ImVec2 widgetSize(size, size);
-
     // Позиция верхнего левого угла виджета в координатах фреймбуфера ImGui
     ImVec2 pos = ImGui::GetCursorScreenPos();
 
     // Резервируем место под орб
-    ImGui::InvisibleButton("##voice_orb", widgetSize);
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImGui::InvisibleButton("##voice_orb", avail);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
     // Нам нужен прямоугольник орба и высота фреймбуфера,
     // чтобы правильно выставить glViewport/glScissor
     ImVec2 min = pos;
-    ImVec2 max = ImVec2(pos.x + widgetSize.x, pos.y + widgetSize.y);
+    ImVec2 max = ImVec2(pos.x + avail.x, pos.y + avail.y);
     float fbHeight = ImGui::GetIO().DisplaySize.y;
 
     struct OrbCtx {
         GLuint prog;
         GLint levelLoc;
         GLint timeLoc;
+        GLint aspectLoc;
         GLuint vao;
         float level;
         float time;
+        float aspect;
         ImVec2 min;
         ImVec2 max;
         float fbHeight;
@@ -1437,6 +1412,7 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
     auto* ctx = new OrbCtx{.prog = prog,
                            .levelLoc = levelLoc,
                            .timeLoc = timeLoc,
+                           .aspectLoc = aspectLoc,
                            .vao = vao,
                            .level = std::clamp(level, 0.0f, 1.0f),
                            .time = static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1444,6 +1420,7 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
                                                           .count() -
                                                       startMsec) /
                                    1000,
+                           .aspect = avail.x / avail.y,
                            .min = min,
                            .max = max,
                            .fbHeight = fbHeight};
@@ -1471,6 +1448,7 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
             glUseProgram(c->prog);
             glUniform1f(c->levelLoc, c->level);
             glUniform1f(c->timeLoc, c->time);
+            glUniform1f(c->aspectLoc, c->aspect);
             glBindVertexArray(c->vao);
             glDrawArrays(GL_TRIANGLES, 0, 6);
             glBindVertexArray(0);
@@ -1523,7 +1501,7 @@ struct CallState {
 
     // UI / misc
     bool micMuted{false};
-    bool forceTurnOnly{true};
+    bool forceTurnOnly{false};
     float inLevel{0.0f};
     float outlevel{0.0f};
 };
@@ -1532,14 +1510,26 @@ struct CallState {
 // main()
 // ------------------------------------------------------------
 
-int main(int /* argc */, char* argv[]) {
+int main(int argc, char* argv[]) {
+    std::string defaultCaller{"user1"};
+    std::string defaultCallee{"user2"};
+    bool isControlling{true};
+    if (argc == 4) {
+        defaultCaller = argv[1];
+        defaultCallee = argv[2];
+        isControlling = std::string{argv[3]} == std::string{"true"} ? true : false;
+    }
+
+    CallState app;
+    app.iceIsCaller = isControlling;
+
     spdlog::set_default_logger(spdlog::stdout_color_mt("default", spdlog::color_mode::always));
     spdlog::set_level(spdlog::level::debug);
 
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
 
-    if (not SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    if (not SDL_Init(SDL_INIT_VIDEO)) {
         Fatal(std::string("SDL_Init failed: ") + SDL_GetError());
     }
 
@@ -1563,8 +1553,6 @@ int main(int /* argc */, char* argv[]) {
     ImGui_ImplSDL3_InitForOpenGL(window, glctx);
     ImGui_ImplOpenGL3_Init("#version 300 es");
 
-    CallState app;
-
     if (!app.audio.init()) {
         std::cerr << "Audio init failed\n";
     }
@@ -1583,12 +1571,13 @@ int main(int /* argc */, char* argv[]) {
     auto lastIcePoll = std::chrono::steady_clock::now();
 
     // UI state
-    static char sigHostBuf[64] = "127.0.0.1";
+    static char sigHostBuf[64] = "213.171.24.94";
     static int sigPort = 7777;
-    static char sigUserBuf[32] = "user1";
+    static char sigUserBuf[32] = "";
     static char sigPassBuf[32] = "pass123";
+    memcpy(static_cast<void*>(sigUserBuf), defaultCaller.c_str(), defaultCaller.size());
 
-    static char stunWTurnHostBuf[64] = "127.0.0.1";
+    static char stunWTurnHostBuf[64] = "213.171.24.94";
     static int stunWTurnPortUI = 3478;
 
     while (running) {
@@ -1677,7 +1666,7 @@ int main(int /* argc */, char* argv[]) {
         // периодический автопул ключей и ICE-ответов (чтобы не дергать руками
         // слишком часто)
         if (!app.signaling.token().empty()) {
-            if (now - lastKeyPoll > std::chrono::milliseconds(1000)) {
+            if (now - lastKeyPoll > std::chrono::milliseconds(3000)) {
                 lastKeyPoll = now;
                 std::string from, keyCipherB64, err;
                 if (app.signaling.pollEncryptedKey(from, keyCipherB64, err)) {
@@ -1759,280 +1748,242 @@ int main(int /* argc */, char* argv[]) {
         // clang-format on
 
         // Auth
-        ImGui::Text("Signaling");
-        ImGui::InputText("Host", sigHostBuf, sizeof(sigHostBuf));
-        ImGui::InputInt("Port", &sigPort);
-        ImGui::InputText("Login", sigUserBuf, sizeof(sigUserBuf));
-        ImGui::InputText("Password", sigPassBuf, sizeof(sigPassBuf), ImGuiInputTextFlags_Password);
+        if (app.signaling.token().empty()) {
+            ImGui::Text("Signaling");
+            ImGui::InputText("Host", sigHostBuf, sizeof(sigHostBuf));
+            ImGui::InputInt("Port", &sigPort);
+            ImGui::InputText("Login", sigUserBuf, sizeof(sigUserBuf));
+            ImGui::InputText("Password", sigPassBuf, sizeof(sigPassBuf), ImGuiInputTextFlags_Password);
 
-        if (ImGui::Button("AUTH")) {
-            app.sigError.clear();
-            app.sigStatus.clear();
-            app.signaling.setServer(sigHostBuf, (uint16_t)sigPort);
-            app.signaling.setCredentials(sigUserBuf, sigPassBuf);
-            if (app.signaling.authenticate(app.sigError)) {
-                app.sigStatus = "AUTH OK, token=" + app.signaling.token();
-            } else {
-                app.sigStatus = "AUTH FAILED";
-            }
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("REGISTER")) {
-            app.sigError.clear();
-            app.sigStatus.clear();
-
-            // Требуем, чтобы ICE уже собрал кандидатов
-            if (!app.iceInited || !app.ice.haveLocalDesc) {
-                app.sigError = "ICE not ready: init ICE and wait for candidates";
-                app.sigStatus = "REGISTER FAILED";
-            } else {
-                std::string ip = app.ice.localIp;
-                uint16_t port = app.ice.localPort;
-
-                // При включённом Force TURN only тут как раз будет relay-адрес
-                if (app.signaling.registerSelf(ip, port, app.sigError)) {
-                    app.sigStatus =
-                        "REGISTER OK: " + ip + ":" + std::to_string(port) + " (type=" + app.ice.localType + ")";
+            if (ImGui::Button("AUTH")) {
+                app.sigError.clear();
+                app.sigStatus.clear();
+                app.signaling.setServer(sigHostBuf, (uint16_t)sigPort);
+                app.signaling.setCredentials(sigUserBuf, sigPassBuf);
+                if (app.signaling.authenticate(app.sigError)) {
+                    app.sigStatus = "AUTH OK, token=" + app.signaling.token();
                 } else {
-                    app.sigStatus = "REGISTER FAILED";
+                    app.sigStatus = "AUTH FAILED";
                 }
             }
-        }
-
-        static char queryUserBuf[32] = "user2\0";
-        ImGui::InputText("Find user", queryUserBuf, sizeof(queryUserBuf));
-        if (ImGui::Button("QUERY")) {
-            std::string ip;
-            uint16_t port{};
-            if (app.signaling.queryUser(queryUserBuf, ip, port, app.sigError)) {
-                app.sigStatus = "QUERY OK: " + ip + ":" + std::to_string(port);
-            } else {
-                app.sigStatus = "QUERY FAILED";
-            }
-        }
-
-        app.peerUser = std::string{queryUserBuf};
-        if (ImGui::Button("Get peer RSA pubkey")) {
-            app.sigError.clear();
-            app.sigStatus.clear();
-            if (app.signaling.getUserPubKey(app.peerUser, app.peerPub, app.sigError)) {
-                app.sigStatus = "Got peer pubkey for " + app.peerUser;
-            } else {
-                app.sigStatus = "PUBKEY FAILED";
-            }
-        }
-
-        if (!app.sigStatus.empty()) ImGui::Text("Status: %s", app.sigStatus.c_str());
-        if (!app.sigError.empty()) ImGui::TextColored(ImVec4(1, 0, 0, 1), "Error: %s", app.sigError.c_str());
-
-        ImGui::Separator();
-
-        // Crypto / mic
-        ImGui::Checkbox("Encrypt audio (AES-GCM)", &app.encryptionEnabled);
-        if (ImGui::Checkbox("Mic muted", &app.micMuted)) {
-            app.audio.setMuted(app.micMuted);
-        }
-
-        if (ImGui::Button("Rotate TX key & send to peer")) {
-            if (!app.peerPub.valid()) {
-                app.sigError = "Peer pubkey not loaded";
-            } else {
-                randomKey(app.txKey);
-                app.aesTx.setKey(app.txKey);
-                std::vector<uint8_t> plain(32);
-                std::memcpy(plain.data(), app.txKey.key.data(), 32);
-                std::vector<uint8_t> cipher;
-                if (app.peerPub.encrypt(plain, cipher)) {
-                    std::string b64 = B64Encode(cipher);
-                    if (app.signaling.pushEncryptedKey(app.peerUser, b64, app.sigError)) {
-                        app.sigStatus = "TX key rotated & sent to " + app.peerUser;
-                    } else {
-                        app.sigStatus = "KEY_PUSH FAILED";
-                    }
-                } else {
-                    app.sigError = "RSA encrypt key failed";
-                }
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Poll RX key now")) {
-            std::string from, keyCipherB64, err;
-            if (app.signaling.pollEncryptedKey(from, keyCipherB64, err)) {
-                std::vector<uint8_t> cipher;
-                if (B64Decode(keyCipherB64, cipher)) {
-                    std::vector<uint8_t> plain;
-                    if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                        if (plain.size() == 32) {
-                            std::memcpy(app.rxKey.key.data(), plain.data(), 32);
-                            app.aesRx.setKey(app.rxKey);
-                            app.sigStatus = "Manually received RX key from " + from;
-                        }
-                    }
-                }
-            } else {
-                if (!err.empty()) app.sigError = err;
-            }
-        }
-
-        ImGui::Separator();
-
-        // STUN/TURN
-        ImGui::Text("STUN/TURN");
-        ImGui::InputText("STUN/TURN host", stunWTurnHostBuf, sizeof(stunWTurnHostBuf));
-        ImGui::InputInt("STUN/TURN port", &stunWTurnPortUI);
-        ImGui::Checkbox("Force TURN only (no direct)", &app.forceTurnOnly);
-
-        ImGui::Separator();
-
-        // ICE control
-        ImGui::Text("ICE");
-        ImGui::Checkbox("This side is Caller (controlling)", &app.iceIsCaller);
-
-        if (ImGui::Button("Init ICE")) {
-            app.ice.shutdown();
-            app.iceError.clear();
-            app.iceStatus.clear();
-            std::string stun = stunWTurnHostBuf;
-            std::string turn = stunWTurnHostBuf;
-            uint16_t stunPort = (uint16_t)std::max(stunWTurnPortUI, 1);
-            uint16_t turnPort = (uint16_t)std::max(stunWTurnPortUI, 1);
-            if (app.ice.init(stun, stunPort, turn, turnPort, sigUserBuf, sigPassBuf, app.forceTurnOnly,
-                             app.iceIsCaller)) {
-                app.iceInited = true;
-                app.iceStatus = "ICE initialized, gathering candidates...";
-            } else {
-                app.iceInited = false;
-                app.iceError = app.ice.lastError;
-            }
-        }
-
-        if (app.iceInited && app.ice.gatheringDone && app.iceLocalDesc.empty()) {
-            std::string desc;
-            if (app.ice.buildLocalDescription(desc)) {
-                app.iceLocalDesc = desc;
-            }
-        }
-
-        if (!app.iceLocalDesc.empty()) {
-            ImGui::TextWrapped("Local ICE: %s", app.iceLocalDesc.c_str());
-        }
-        if (!app.iceRemoteDesc.empty()) {
-            ImGui::TextWrapped("Remote ICE: %s", app.iceRemoteDesc.c_str());
-        }
-
-        if (ImGui::Button("Send ICE offer (Caller)")) {
-            if (!app.iceIsCaller) {
-                app.iceError = "This side not marked as Caller";
-            } else if (!app.peerPub.valid()) {
-                app.iceError = "Peer pubkey not loaded";
-            } else if (app.iceLocalDesc.empty()) {
-                app.iceError = "Local ICE not ready yet";
-            } else {
-                std::vector<uint8_t> plain(app.iceLocalDesc.begin(), app.iceLocalDesc.end());
-                std::vector<uint8_t> cipher;
-                if (app.peerPub.encrypt(plain, cipher)) {
-                    std::string b64 = B64Encode(cipher);
-                    if (app.signaling.pushEncryptedIceOffer(app.peerUser, b64, app.iceError)) {
-                        app.iceStatus = "ICE offer sent to " + app.peerUser;
-                    } else {
-                        app.iceStatus = "ICE_OFFER FAILED";
-                    }
-                } else {
-                    app.iceError = "RSA encrypt ICE offer failed";
-                }
-            }
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("Poll ICE offer (Callee)")) {
-            std::string from, blobB64, err;
-            if (app.signaling.pollEncryptedIceOffer(from, blobB64, err)) {
-                std::vector<uint8_t> cipher;
-                if (B64Decode(blobB64, cipher)) {
-                    std::vector<uint8_t> plain;
-                    if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                        std::string desc((char*)plain.data(), plain.size());
-                        if (app.ice.setRemoteDescription(desc)) {
-                            app.peerUser = from;
-                            std::snprintf(app.peerUser.data(), app.peerUser.size(), "%s", from.c_str());
-                            app.iceRemoteDesc = desc;
-                            app.iceStatus = "Got ICE offer from " + from;
-                        } else {
-                            app.iceError = app.ice.lastError;
-                        }
-                    }
-                }
-            } else if (!err.empty()) {
-                app.iceError = err;
-            }
-        }
-
-        if (ImGui::Button("Send ICE answer (Callee)")) {
-            if (app.iceIsCaller) {
-                app.iceError = "This side not marked as Callee";
-            } else if (!app.peerPub.valid()) {
-                app.iceError = "Peer pubkey not loaded";
-            } else if (app.iceLocalDesc.empty()) {
-                app.iceError = "Local ICE not ready yet";
-            } else {
-                std::vector<uint8_t> plain(app.iceLocalDesc.begin(), app.iceLocalDesc.end());
-                std::vector<uint8_t> cipher;
-                if (app.peerPub.encrypt(plain, cipher)) {
-                    std::string b64 = B64Encode(cipher);
-                    if (app.signaling.pushEncryptedIceAnswer(app.peerUser, b64, app.iceError)) {
-                        app.iceStatus = "ICE answer sent to " + app.peerUser;
-                    } else {
-                        app.iceStatus = "ICE_ANSWER FAILED";
-                    }
-                } else {
-                    app.iceError = "RSA encrypt ICE answer failed";
-                }
-            }
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("Poll ICE answer (Caller)")) {
-            std::string from, blobB64, err;
-            if (app.signaling.pollEncryptedIceAnswer(from, blobB64, err)) {
-                std::vector<uint8_t> cipher;
-                if (B64Decode(blobB64, cipher)) {
-                    std::vector<uint8_t> plain;
-                    if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                        std::string desc((char*)plain.data(), plain.size());
-                        if (app.ice.setRemoteDescription(desc)) {
-                            app.peerUser = from;
-                            std::snprintf(app.peerUser.data(), app.peerUser.size(), "%s", from.c_str());
-                            app.iceRemoteDesc = desc;
-                            app.iceStatus = "Got ICE answer from " + from;
-                        } else {
-                            app.iceError = app.ice.lastError;
-                        }
-                    }
-                }
-            } else if (!err.empty()) {
-                app.iceError = err;
-            }
-        }
-
-        if (app.ice.connected) {
-            ImGui::TextColored(ImVec4(0, 1, 0, 1), "ICE connected");
         } else {
-            ImGui::Text("ICE not connected");
-        }
+            static char callingUserBuf[32] = "";
+            memcpy(static_cast<void*>(callingUserBuf), defaultCallee.c_str(), defaultCallee.size());
+            ImGui::InputText("Calling user", callingUserBuf, sizeof(callingUserBuf));
 
-        if (!app.iceStatus.empty()) ImGui::Text("ICE status: %s", app.iceStatus.c_str());
-        if (!app.iceError.empty()) ImGui::TextColored(ImVec4(1, 0, 0, 1), "ICE error: %s", app.iceError.c_str());
+            app.peerUser = std::string{callingUserBuf};
+            if (ImGui::Button("Get peer RSA pubkey")) {
+                app.sigError.clear();
+                app.sigStatus.clear();
+                if (app.signaling.getUserPubKey(app.peerUser, app.peerPub, app.sigError)) {
+                    app.sigStatus = "Got peer pubkey for " + app.peerUser;
+                } else {
+                    app.sigStatus = "PUBKEY FAILED";
+                }
+            }
 
-        ImGui::Separator();
-        ImGui::Text("Mic level: %.3f", app.inLevel);
-        ImGui::ProgressBar(app.inLevel, ImVec2(0.0f, 0.0f));
+            if (!app.sigStatus.empty()) ImGui::Text("Status: %s", app.sigStatus.c_str());
+            if (!app.sigError.empty()) ImGui::TextColored(ImVec4(1, 0, 0, 1), "Error: %s", app.sigError.c_str());
 
-        ImGui::Text("Caller level: %.3f", app.outlevel);
-        try {
-            DrawVoiceOrb(argv[0], app.outlevel);
-        } catch (const std::runtime_error& e) {
-            std::cerr << "Shader load error: " << e.what() << "\n";
+            ImGui::Separator();
+
+            // ICE
+            ImGui::Text("ICE");
+            ImGui::InputText("STUN/TURN host", stunWTurnHostBuf, sizeof(stunWTurnHostBuf));
+            ImGui::InputInt("STUN/TURN port", &stunWTurnPortUI);
+            ImGui::Checkbox("Force TURN only (no direct)", &app.forceTurnOnly);
+            ImGui::SameLine();
+            ImGui::Checkbox("This side is Caller (controlling)", &app.iceIsCaller);
+
+            if (ImGui::Button("Init ICE")) {
+                app.ice.shutdown();
+                app.iceError.clear();
+                app.iceStatus.clear();
+                std::string stun = stunWTurnHostBuf;
+                std::string turn = stunWTurnHostBuf;
+                uint16_t stunPort = (uint16_t)std::max(stunWTurnPortUI, 1);
+                uint16_t turnPort = (uint16_t)std::max(stunWTurnPortUI, 1);
+                if (app.ice.init(stun, stunPort, turn, turnPort, sigUserBuf, sigPassBuf, app.forceTurnOnly,
+                                 app.iceIsCaller)) {
+                    app.iceInited = true;
+                    app.iceStatus = "ICE initialized, gathering candidates...";
+                } else {
+                    app.iceInited = false;
+                    app.iceError = app.ice.lastError;
+                }
+            }
+
+            if (app.iceInited && app.ice.gatheringDone && app.iceLocalDesc.empty()) {
+                std::string desc;
+                if (app.ice.buildLocalDescription(desc)) {
+                    app.iceLocalDesc = desc;
+                }
+            }
+
+            if (!app.iceLocalDesc.empty()) {
+                ImGui::TextWrapped("Local ICE: %s", app.iceLocalDesc.c_str());
+            }
+            if (!app.iceRemoteDesc.empty()) {
+                ImGui::TextWrapped("Remote ICE: %s", app.iceRemoteDesc.c_str());
+            }
+
+            if (app.iceIsCaller) {
+                if (ImGui::Button("Send ICE offer (Caller)")) {
+                    if (!app.peerPub.valid()) {
+                        app.iceError = "Peer pubkey not loaded";
+                    } else if (app.iceLocalDesc.empty()) {
+                        app.iceError = "Local ICE not ready yet";
+                    } else {
+                        std::vector<uint8_t> plain(app.iceLocalDesc.begin(), app.iceLocalDesc.end());
+                        std::vector<uint8_t> cipher;
+                        if (app.peerPub.encrypt(plain, cipher)) {
+                            std::string b64 = B64Encode(cipher);
+                            if (app.signaling.pushEncryptedIceOffer(app.peerUser, b64, app.iceError)) {
+                                app.iceStatus = "ICE offer sent to " + app.peerUser;
+                            } else {
+                                app.iceStatus = "ICE_OFFER FAILED";
+                            }
+                        } else {
+                            app.iceError = "RSA encrypt ICE offer failed";
+                        }
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Poll ICE answer (Caller)")) {
+                    std::string from, blobB64, err;
+                    if (app.signaling.pollEncryptedIceAnswer(from, blobB64, err)) {
+                        std::vector<uint8_t> cipher;
+                        if (B64Decode(blobB64, cipher)) {
+                            std::vector<uint8_t> plain;
+                            if (app.signaling.clientKey().decrypt(cipher, plain)) {
+                                std::string desc((char*)plain.data(), plain.size());
+                                if (app.ice.setRemoteDescription(desc)) {
+                                    app.peerUser = from;
+                                    std::snprintf(app.peerUser.data(), app.peerUser.size(), "%s", from.c_str());
+                                    app.iceRemoteDesc = desc;
+                                    app.iceStatus = "Got ICE answer from " + from;
+                                } else {
+                                    app.iceError = app.ice.lastError;
+                                }
+                            }
+                        }
+                    } else if (!err.empty()) {
+                        app.iceError = err;
+                    }
+                }
+            } else {
+                if (ImGui::Button("Send ICE answer (Callee)")) {
+                    if (!app.peerPub.valid()) {
+                        app.iceError = "Peer pubkey not loaded";
+                    } else if (app.iceLocalDesc.empty()) {
+                        app.iceError = "Local ICE not ready yet";
+                    } else {
+                        std::vector<uint8_t> plain(app.iceLocalDesc.begin(), app.iceLocalDesc.end());
+                        std::vector<uint8_t> cipher;
+                        if (app.peerPub.encrypt(plain, cipher)) {
+                            std::string b64 = B64Encode(cipher);
+                            if (app.signaling.pushEncryptedIceAnswer(app.peerUser, b64, app.iceError)) {
+                                app.iceStatus = "ICE answer sent to " + app.peerUser;
+                            } else {
+                                app.iceStatus = "ICE_ANSWER FAILED";
+                            }
+                        } else {
+                            app.iceError = "RSA encrypt ICE answer failed";
+                        }
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Poll ICE offer (Callee)")) {
+                    std::string from, blobB64, err;
+                    if (app.signaling.pollEncryptedIceOffer(from, blobB64, err)) {
+                        std::vector<uint8_t> cipher;
+                        if (B64Decode(blobB64, cipher)) {
+                            std::vector<uint8_t> plain;
+                            if (app.signaling.clientKey().decrypt(cipher, plain)) {
+                                std::string desc((char*)plain.data(), plain.size());
+                                if (app.ice.setRemoteDescription(desc)) {
+                                    app.peerUser = from;
+                                    std::snprintf(app.peerUser.data(), app.peerUser.size(), "%s", from.c_str());
+                                    app.iceRemoteDesc = desc;
+                                    app.iceStatus = "Got ICE offer from " + from;
+                                } else {
+                                    app.iceError = app.ice.lastError;
+                                }
+                            }
+                        }
+                    } else if (!err.empty()) {
+                        app.iceError = err;
+                    }
+                }
+            }
+
+            if (app.ice.connected) {
+                ImGui::TextColored(ImVec4(0, 1, 0, 1), "ICE connected");
+            } else {
+                ImGui::Text("ICE not connected");
+            }
+
+            if (!app.iceStatus.empty()) ImGui::Text("ICE status: %s", app.iceStatus.c_str());
+            if (!app.iceError.empty()) ImGui::TextColored(ImVec4(1, 0, 0, 1), "ICE error: %s", app.iceError.c_str());
+
+            ImGui::Separator();
+
+            // Crypto / audio
+            ImGui::Checkbox("Encrypt audio (AES-GCM)", &app.encryptionEnabled);
+            if (ImGui::Checkbox("Mic muted", &app.micMuted)) {
+                app.audio.setMuted(app.micMuted);
+            }
+
+            if (ImGui::Button("Rotate TX key & send to peer")) {
+                if (!app.peerPub.valid()) {
+                    app.sigError = "Peer pubkey not loaded";
+                } else {
+                    randomKey(app.txKey);
+                    app.aesTx.setKey(app.txKey);
+                    std::vector<uint8_t> plain(32);
+                    std::memcpy(plain.data(), app.txKey.key.data(), 32);
+                    std::vector<uint8_t> cipher;
+                    if (app.peerPub.encrypt(plain, cipher)) {
+                        std::string b64 = B64Encode(cipher);
+                        if (app.signaling.pushEncryptedKey(app.peerUser, b64, app.sigError)) {
+                            app.sigStatus = "TX key rotated & sent to " + app.peerUser;
+                        } else {
+                            app.sigStatus = "KEY_PUSH FAILED";
+                        }
+                    } else {
+                        app.sigError = "RSA encrypt key failed";
+                    }
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Poll RX key now")) {
+                std::string from, keyCipherB64, err;
+                if (app.signaling.pollEncryptedKey(from, keyCipherB64, err)) {
+                    std::vector<uint8_t> cipher;
+                    if (B64Decode(keyCipherB64, cipher)) {
+                        std::vector<uint8_t> plain;
+                        if (app.signaling.clientKey().decrypt(cipher, plain)) {
+                            if (plain.size() == 32) {
+                                std::memcpy(app.rxKey.key.data(), plain.data(), 32);
+                                app.aesRx.setKey(app.rxKey);
+                                app.sigStatus = "Manually received RX key from " + from;
+                            }
+                        }
+                    }
+                } else {
+                    if (!err.empty()) app.sigError = err;
+                }
+            }
+
+            ImGui::Text("Mic level: %.3f", app.inLevel);
+            ImGui::ProgressBar(app.inLevel, ImVec2(0.0f, 0.0f));
+
+            ImGui::Text("Caller level: %.3f", app.outlevel);
+            try {
+                DrawVoiceOrb(argv[0], app.outlevel);
+            } catch (const std::runtime_error& e) {
+                std::cerr << "Shader load error: " << e.what() << "\n";
+            }
         }
 
         ImGui::End();
