@@ -1340,6 +1340,67 @@ static GLuint createProgram(const std::string& vs, const std::string& fs) {
     return p;
 }
 
+constexpr const char* kDefOrbVertCode = R"(
+#version 300 es
+
+layout(location = 0) in vec2 pos;
+out vec2 uv;
+
+void main() {
+    uv = pos;
+    gl_Position = vec4(pos, 0.0f, 1.0f);
+}
+)";
+
+constexpr const char* kDefOrbFragCode = R"(
+#version 300 es
+
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+in vec2 uv;
+out vec4 fragColor;
+
+uniform float u_level;
+uniform float u_time;
+uniform float u_aspect;
+
+vec4 ColorOrbWave(vec4 col1, vec4 col2, float coef) {
+    vec2 curPos = vec2(uv.x * u_aspect, uv.y);
+    float sine1 = sin(2.f * coef * atan(curPos.y / curPos.x) + u_time * coef);
+    float sine2 = sin(4.f * coef * atan(curPos.y / curPos.x) + u_time * coef);
+    float wave = 0.4f + 0.1f * pow(u_level, 0.6f) * coef * (1.f + sine1 * sine2);
+
+    float thickness = 0.01f;
+    float bloor = 0.05f;
+    float colorStart = wave - thickness / 2.f - bloor / 2.f;
+    float colorEnd = wave + thickness / 2.f + bloor / 2.f;
+
+    float r = length(curPos);
+    float diff = r - wave;
+
+    float outerEdge = smoothstep(colorEnd, wave + thickness / 2.f, r);
+    float innerEdge = smoothstep(colorStart, wave - thickness / 2.f, r);
+
+    float mixCoef = diff < 0.0f ? innerEdge : outerEdge;
+    return mix(col1, col2, mixCoef);
+}
+
+void main() {
+    vec4 col1 = vec4(0.824f, 0.847f, 0.89f, 1.f); // #d2d8e3
+    vec4 col2 = vec4(0.137f, 0.263f, 0.53f, 1.f); // #234388
+
+    vec4 result = vec4(0);
+    int count = 4;
+    for(int i = 0; i < count; ++i) {
+        result += ColorOrbWave(col1, col2, float(i)) / float(count);
+    }
+
+    fragColor = result;
+}
+)";
+
 void DrawVoiceOrb(const std::string& execPath, float level) {
     // Ленивое создание шейдера и геометрии
     static bool initialized = false;
@@ -1350,12 +1411,19 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
     static GLuint vao = 0;
     static GLuint vbo = 0;
 
-    std::string execBasePath = execPath.substr(0, execPath.find_last_of('/'));
-    const static std::string kOrbVertCode = LoadFile(execBasePath + "/shaders/voice_vis_shader.vert");
-    const static std::string kOrbFragCode = LoadFile(execBasePath + "/shaders/voice_vis_shader.frag");
-
     if (!initialized) {
-        prog = createProgram(kOrbVertCode, kOrbFragCode);
+        std::string execBasePath = execPath.substr(0, execPath.find_last_of('/'));
+        std::string orbVertCode{};
+        std::string orbFragCode{};
+        try {
+            orbVertCode = LoadFile(execBasePath + "/shaders/voice_vis_shader.vert");
+            orbFragCode = LoadFile(execBasePath + "/shaders/voice_vis_shader.frag");
+        } catch (const std::runtime_error& e) {
+            orbVertCode = kDefOrbVertCode;
+            orbFragCode = kDefOrbFragCode;
+        }
+        prog = createProgram(orbVertCode.empty() ? std::string{kDefOrbVertCode} : orbVertCode,
+                             orbFragCode.empty() ? std::string{kDefOrbFragCode} : orbFragCode);
         levelLoc = glGetUniformLocation(prog, "u_level");
         timeLoc = glGetUniformLocation(prog, "u_time");
         aspectLoc = glGetUniformLocation(prog, "u_aspect");
@@ -1574,8 +1642,10 @@ int main(int argc, char* argv[]) {
     static char sigHostBuf[64] = "213.171.24.94";
     static int sigPort = 7777;
     static char sigUserBuf[32] = "";
+    static char callingUserBuf[32] = "";
     static char sigPassBuf[32] = "pass123";
     memcpy(static_cast<void*>(sigUserBuf), defaultCaller.c_str(), defaultCaller.size());
+    memcpy(static_cast<void*>(callingUserBuf), defaultCallee.c_str(), defaultCallee.size());
 
     static char stunWTurnHostBuf[64] = "213.171.24.94";
     static int stunWTurnPortUI = 3478;
@@ -1767,8 +1837,6 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else {
-            static char callingUserBuf[32] = "";
-            memcpy(static_cast<void*>(callingUserBuf), defaultCallee.c_str(), defaultCallee.size());
             ImGui::InputText("Calling user", callingUserBuf, sizeof(callingUserBuf));
 
             app.peerUser = std::string{callingUserBuf};
@@ -1979,11 +2047,7 @@ int main(int argc, char* argv[]) {
             ImGui::ProgressBar(app.inLevel, ImVec2(0.0f, 0.0f));
 
             ImGui::Text("Caller level: %.3f", app.outlevel);
-            try {
-                DrawVoiceOrb(argv[0], app.outlevel);
-            } catch (const std::runtime_error& e) {
-                std::cerr << "Shader load error: " << e.what() << "\n";
-            }
+            DrawVoiceOrb(argv[0], app.outlevel);
         }
 
         ImGui::End();

@@ -5,7 +5,6 @@
             "name": "Debug",
             "displayName": "Debug",
             "binaryDir": "${sourceDir}/build/${presetName}",
-            "installDir": "${sourceDir}/install/${presetName}",
             "toolchainFile": "${sourceDir}/dependencies/build/Debug/generators/conan_toolchain.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
@@ -18,7 +17,7 @@
             "name": "Release",
             "inherits": "Debug",
             "binaryDir": "${sourceDir}/build/${presetName}",
-            "installDir": "${sourceDir}/install/${presetName}",
+            "installDir": "${sourceDir}/artifacts/usr",
             "toolchainFile": "${sourceDir}/dependencies/build/Release/generators/conan_toolchain.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"

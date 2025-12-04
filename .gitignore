@@ -1,3 +1,6 @@
 build/
 .vscode/
 imgui_bindings/
+artifacts/*
+!artifacts/assets/
+!artifacts/scripts/

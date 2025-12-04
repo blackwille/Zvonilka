@@ -50,3 +50,5 @@ if (UNIX AND NOT APPLE)
   find_package(X11 REQUIRED)
   target_link_libraries(${PROJECT_NAME} PRIVATE X11::X11 dl)
 endif()
+
+install(TARGETS ${PROJECT_NAME})
