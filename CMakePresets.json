@@ -4,20 +4,31 @@
         {
             "name": "Debug",
             "displayName": "Debug",
+            "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/${presetName}",
             "toolchainFile": "${sourceDir}/dependencies/build/Debug/generators/conan_toolchain.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "/usr/bin/clang",
-                "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": true
             }
         },
         {
-            "name": "Release",
+            "name": "Release Linux",
             "inherits": "Debug",
             "binaryDir": "${sourceDir}/build/${presetName}",
-            "installDir": "${sourceDir}/artifacts/usr",
+            "installDir": "${sourceDir}/artifacts/linux/usr",
+            "toolchainFile": "${sourceDir}/dependencies/build/Release/generators/conan_toolchain.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "Release Windows",
+            "inherits": "Debug",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "installDir": "${sourceDir}/artifacts/windows",
             "toolchainFile": "${sourceDir}/dependencies/build/Release/generators/conan_toolchain.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
