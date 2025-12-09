@@ -1,7 +1,7 @@
 #!/bin/sh
 
 DEPENDENCIES_DIR=$(dirname $(dirname $(dirname $(realpath $0))))
-INSTALLATION_DIR=${DEPENDENCIES_DIR}/../artifacts/linux/
+INSTALLATION_DIR=${DEPENDENCIES_DIR}/../deploy/linux/
 conan install ${DEPENDENCIES_DIR} --settings=build_type=Release --deployer=full_deploy --deployer-folder=${INSTALLATION_DIR}
 
 FULL_DEPLOY_BASE=${INSTALLATION_DIR}"/full_deploy"
@@ -26,5 +26,5 @@ echo "Copied headers from Release/include to ${INSTALL_INCLUDE_DIR}"
 # Clean up the temporary, nested full_deploy folder structure
 rm -rf "${FULL_DEPLOY_BASE}"
 
-echo "Conan artifacts structure is now ready for linuxdeploy in the 'artifacts' folder."
+echo "Conan deploy structure is now ready for linuxdeploy in the 'deploy' folder."
 

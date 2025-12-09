@@ -27,7 +27,7 @@
 //      - AUTH: RSA-авторизация по login/pass, токен.
 //      - PUBKEY: получить публичный ключ другого пользователя.
 //      - KEY_PUSH / KEY_POLL: обмен зашифрованными AES-ключами.
-//      - ICE_OFFER / ICE_POLL_OFFER / ICE_ANSWER / ICE_POLL_ANSWER:
+//      - ICE_REQUEST / ICE_POLL_REQUEST:
 //        обмен зашифрованными ICE-параметрами.
 //
 //    Все данные, которые содержат ключи (AES/ICE), шифруются RSA
@@ -41,8 +41,7 @@
 //          * Вкл/выкл шифрование аудио.
 //          * Смена TX-ключа и отправка собеседнику.
 //          * Получение нового RX-ключа.
-//          * ICE: Caller / Callee, отправка offer/answer,
-//            получение offer/answer.
+//          * ICE: отправка request, получение request.
 //      - Простая визуализация через внешние шейдеры:
 //          shaders/voice_vis_shader.vert
 //          shaders/voice_vis_shader.frag
@@ -473,8 +472,7 @@ public:
             std::cerr << "miniaudio start failed\n";
             return false;
         }
-        // размер jitter-буфера, напр. 80 мс
-        rbCapacityFrames_ = cfg.sampleRate / 1000 * 200;  // 80ms
+        rbCapacityFrames_ = cfg.sampleRate / 1000 * 400;  // 160ms
         if (ma_pcm_rb_init(ma_format_f32, cfg.capture.channels, rbCapacityFrames_, nullptr, nullptr, &playbackRb_) !=
             MA_SUCCESS) {
             return false;
@@ -687,7 +685,6 @@ struct IceSession {
     NiceAgent* agent{nullptr};
     guint streamId{0};
     guint compId{1};
-    bool controlling{true};
     bool forceTurn{false};
 
     bool gatheringDone{false};
@@ -790,9 +787,8 @@ struct IceSession {
     }
 
     bool init(const std::string& stunHost, uint16_t stunPort, const std::string& turnHost, uint16_t turnPort,
-              const std::string& turnUser, const std::string& turnPass, bool forceTurnOnly, bool isControlling) {
+              const std::string& turnUser, const std::string& turnPass, bool forceTurnOnly) {
         forceTurn = forceTurnOnly;
-        controlling = isControlling;
 
         ctx = g_main_context_new();
         if (!ctx) {
@@ -834,8 +830,6 @@ struct IceSession {
                 return false;
             }
         }
-
-        g_object_set(G_OBJECT(agent), "controlling-mode", controlling ? TRUE : FALSE, nullptr);
 
         g_signal_connect(agent, "candidate-gathering-done", G_CALLBACK(cb_gathering_done), this);
         g_signal_connect(agent, "component-state-changed", G_CALLBACK(cb_state_changed), this);
@@ -1144,95 +1138,49 @@ public:
         return true;
     }
 
-    // --- ICE offer/answer (blob шифруется RSA ключом peer’а) ---
+    // --- ICE request (blob шифруется RSA ключом peer’а) ---
 
-    bool pushEncryptedIceOffer(const std::string& peer, const std::string& blobB64, std::string& err) {
+    bool pushEncryptedIceRequest(const std::string& peer, const std::string& blobB64, std::string& err) {
         err.clear();
         if (token_.empty()) {
             err = "No auth token";
             return false;
         }
         std::ostringstream line;
-        line << "ICE_OFFER " << token_ << " " << peer << " " << blobB64;
+        line << "ICE_REQUEST " << token_ << " " << peer << " " << blobB64;
         std::string resp;
         if (!tcpSendRecv(line.str(), resp)) {
-            err = "ICE_OFFER timeout";
+            err = "ICE_REQUEST timeout";
             return false;
         }
         if (resp != "OK") {
-            err = "ICE_OFFER failed: " + resp;
+            err = "ICE_REQUEST failed: " + resp;
             return false;
         }
         return true;
     }
 
-    bool pollEncryptedIceOffer(std::string& fromUser, std::string& blobB64, std::string& err) {
+    bool pollEncryptedIceRequest(std::string& fromUser, std::string& blobB64, std::string& err) {
         err.clear();
         if (token_.empty()) {
             err = "No auth token";
             return false;
         }
         std::ostringstream line;
-        line << "ICE_POLL_OFFER " << token_;
+        line << "ICE_POLL_REQUEST " << token_;
         std::string resp;
         if (!tcpSendRecv(line.str(), resp)) {
-            err = "ICE_POLL_OFFER timeout";
+            err = "ICE_POLL_REQUEST timeout";
             return false;
         }
         if (resp == "EMPTY") return false;
         if (not resp.starts_with("OK ")) {
-            err = "ICE_POLL_OFFER failed: " + resp;
+            err = "ICE_POLL_REQUEST failed: " + resp;
             return false;
         }
         std::istringstream iss(resp.substr(3));
         if (!(iss >> fromUser >> blobB64)) {
-            err = "ICE_POLL_OFFER parse failed: " + resp;
-            return false;
-        }
-        return true;
-    }
-
-    bool pushEncryptedIceAnswer(const std::string& peer, const std::string& blobB64, std::string& err) {
-        err.clear();
-        if (token_.empty()) {
-            err = "No auth token";
-            return false;
-        }
-        std::ostringstream line;
-        line << "ICE_ANSWER " << token_ << " " << peer << " " << blobB64;
-        std::string resp;
-        if (!tcpSendRecv(line.str(), resp)) {
-            err = "ICE_ANSWER timeout";
-            return false;
-        }
-        if (resp != "OK") {
-            err = "ICE_ANSWER failed: " + resp;
-            return false;
-        }
-        return true;
-    }
-
-    bool pollEncryptedIceAnswer(std::string& fromUser, std::string& blobB64, std::string& err) {
-        err.clear();
-        if (token_.empty()) {
-            err = "No auth token";
-            return false;
-        }
-        std::ostringstream line;
-        line << "ICE_POLL_ANSWER " << token_;
-        std::string resp;
-        if (!tcpSendRecv(line.str(), resp)) {
-            err = "ICE_POLL_ANSWER timeout";
-            return false;
-        }
-        if (resp == "EMPTY") return false;
-        if (not resp.starts_with("OK ")) {
-            err = "ICE_POLL_ANSWER failed: " + resp;
-            return false;
-        }
-        std::istringstream iss(resp.substr(3));
-        if (!(iss >> fromUser >> blobB64)) {
-            err = "ICE_POLL_ANSWER parse failed: " + resp;
+            err = "ICE_POLL_REQUEST parse failed: " + resp;
             return false;
         }
         return true;
@@ -1534,7 +1482,7 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
 // App state
 // ------------------------------------------------------------
 
-struct CallState {
+struct AppState {
     // audio
     AudioEngine audio;
     OpusCodec opus;
@@ -1554,7 +1502,7 @@ struct CallState {
     // ICE
     IceSession ice;
     bool iceInited{false};
-    bool iceIsCaller{true};
+    bool iceIsOnCall{false};
     std::string iceLocalDesc;
     std::string iceRemoteDesc;
     std::string iceStatus;
@@ -1578,15 +1526,10 @@ struct CallState {
 int main(int argc, char* argv[]) {
     std::string defaultCaller{"user1"};
     std::string defaultCallee{"user2"};
-    bool isControlling{true};
-    if (argc == 4) {
+    if (argc == 3) {
         defaultCaller = argv[1];
         defaultCallee = argv[2];
-        isControlling = std::string{argv[3]} == std::string{"true"} ? true : false;
     }
-
-    CallState app;
-    app.iceIsCaller = isControlling;
 
     spdlog::set_default_logger(spdlog::stdout_color_mt("default", spdlog::color_mode::always));
     spdlog::set_level(spdlog::level::debug);
@@ -1649,6 +1592,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    AppState app;
     if (!app.audio.init()) {
         std::cerr << "Audio init failed\n";
     }
@@ -1782,12 +1726,11 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (now - lastIcePoll > std::chrono::milliseconds(1000)) {
+            if (now - lastIcePoll > std::chrono::milliseconds(3000)) {
                 lastIcePoll = now;
-                // если мы callee, ждем offer
-                if (!app.iceIsCaller && app.iceInited && !app.ice.remoteSet) {
+                if (not app.iceIsOnCall && app.iceInited && not app.ice.remoteSet) {
                     std::string from, blobB64, err;
-                    if (app.signaling.pollEncryptedIceOffer(from, blobB64, err)) {
+                    if (app.signaling.pollEncryptedIceRequest(from, blobB64, err)) {
                         std::vector<uint8_t> cipher;
                         if (B64Decode(blobB64, cipher)) {
                             std::vector<uint8_t> plain;
@@ -1796,27 +1739,8 @@ int main(int argc, char* argv[]) {
                                 if (app.ice.setRemoteDescription(desc)) {
                                     app.peerUser = from;
                                     app.iceRemoteDesc = desc;
-                                    app.iceStatus = "Got ICE offer from " + from;
-                                } else {
-                                    app.iceError = app.ice.lastError;
-                                }
-                            }
-                        }
-                    }
-                }
-                // если мы caller, ждем answer
-                if (app.iceIsCaller && app.iceInited && app.ice.remoteSet == false) {
-                    std::string from, blobB64, err;
-                    if (app.signaling.pollEncryptedIceAnswer(from, blobB64, err)) {
-                        std::vector<uint8_t> cipher;
-                        if (B64Decode(blobB64, cipher)) {
-                            std::vector<uint8_t> plain;
-                            if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                                std::string desc((char*)plain.data(), plain.size());
-                                if (app.ice.setRemoteDescription(desc)) {
-                                    app.peerUser = from;
-                                    app.iceRemoteDesc = desc;
-                                    app.iceStatus = "Got ICE answer from " + from;
+                                    app.iceStatus = "Got ICE request from " + from;
+                                    app.iceIsOnCall = true;
                                 } else {
                                     app.iceError = app.ice.lastError;
                                 }
@@ -1865,31 +1789,11 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else {
-            ImGui::InputText("Calling user", callingUserBuf, sizeof(callingUserBuf));
-
-            app.peerUser = std::string{callingUserBuf};
-            if (ImGui::Button("Get peer RSA pubkey")) {
-                app.sigError.clear();
-                app.sigStatus.clear();
-                if (app.signaling.getUserPubKey(app.peerUser, app.peerPub, app.sigError)) {
-                    app.sigStatus = "Got peer pubkey for " + app.peerUser;
-                } else {
-                    app.sigStatus = "PUBKEY FAILED";
-                }
-            }
-
-            if (!app.sigStatus.empty()) ImGui::Text("Status: %s", app.sigStatus.c_str());
-            if (!app.sigError.empty()) ImGui::TextColored(ImVec4(1, 0, 0, 1), "Error: %s", app.sigError.c_str());
-
-            ImGui::Separator();
-
             // ICE
             ImGui::Text("ICE");
             ImGui::InputText("STUN/TURN host", stunWTurnHostBuf, sizeof(stunWTurnHostBuf));
             ImGui::InputInt("STUN/TURN port", &stunWTurnPortUI);
             ImGui::Checkbox("Force TURN only (no direct)", &app.forceTurnOnly);
-            ImGui::SameLine();
-            ImGui::Checkbox("This side is Caller (controlling)", &app.iceIsCaller);
 
             if (ImGui::Button("Init ICE")) {
                 app.ice.shutdown();
@@ -1899,8 +1803,7 @@ int main(int argc, char* argv[]) {
                 std::string turn = stunWTurnHostBuf;
                 uint16_t stunPort = static_cast<uint16_t>(std::max(stunWTurnPortUI, 1));
                 uint16_t turnPort = static_cast<uint16_t>(std::max(stunWTurnPortUI, 1));
-                if (app.ice.init(stun, stunPort, turn, turnPort, sigUserBuf, sigPassBuf, app.forceTurnOnly,
-                                 app.iceIsCaller)) {
+                if (app.ice.init(stun, stunPort, turn, turnPort, sigUserBuf, sigPassBuf, app.forceTurnOnly)) {
                     app.iceInited = true;
                     app.iceStatus = "ICE initialized, gathering candidates...";
                 } else {
@@ -1908,6 +1811,14 @@ int main(int argc, char* argv[]) {
                     app.iceError = app.ice.lastError;
                 }
             }
+
+            ImGui::Separator();
+
+            ImGui::InputText("Calling user", callingUserBuf, sizeof(callingUserBuf));
+            app.peerUser = std::string{callingUserBuf};
+
+            if (!app.sigStatus.empty()) ImGui::Text("Status: %s", app.sigStatus.c_str());
+            if (!app.sigError.empty()) ImGui::TextColored(ImVec4(1, 0, 0, 1), "Error: %s", app.sigError.c_str());
 
             if (app.iceInited && app.ice.gatheringDone && app.iceLocalDesc.empty()) {
                 std::string desc;
@@ -1923,93 +1834,43 @@ int main(int argc, char* argv[]) {
                 ImGui::TextWrapped("Remote ICE: %s", app.iceRemoteDesc.c_str());
             }
 
-            if (app.iceIsCaller) {
-                if (ImGui::Button("Send ICE offer (Caller)")) {
-                    if (!app.peerPub.valid()) {
-                        app.iceError = "Peer pubkey not loaded";
-                    } else if (app.iceLocalDesc.empty()) {
-                        app.iceError = "Local ICE not ready yet";
+            auto SendIceRequest = [&]() {
+                if (!app.peerPub.valid()) {
+                    app.iceError = "Peer pubkey not loaded... Trying to load...";
+                    app.iceStatus.clear();
+                    if (app.signaling.getUserPubKey(app.peerUser, app.peerPub, app.sigError)) {
+                        app.iceStatus = "Got peer pubkey for " + app.peerUser;
+                        app.iceError.clear();
                     } else {
-                        std::vector<uint8_t> plain(app.iceLocalDesc.begin(), app.iceLocalDesc.end());
-                        std::vector<uint8_t> cipher;
-                        if (app.peerPub.encrypt(plain, cipher)) {
-                            std::string b64 = B64Encode(cipher);
-                            if (app.signaling.pushEncryptedIceOffer(app.peerUser, b64, app.iceError)) {
-                                app.iceStatus = "ICE offer sent to " + app.peerUser;
-                            } else {
-                                app.iceStatus = "ICE_OFFER FAILED";
-                            }
-                        } else {
-                            app.iceError = "RSA encrypt ICE offer failed";
-                        }
+                        app.iceStatus = "PUBKEY FAILED";
+                        return;
                     }
                 }
-                ImGui::SameLine();
-                if (ImGui::Button("Poll ICE answer (Caller)")) {
-                    std::string from, blobB64, err;
-                    if (app.signaling.pollEncryptedIceAnswer(from, blobB64, err)) {
-                        std::vector<uint8_t> cipher;
-                        if (B64Decode(blobB64, cipher)) {
-                            std::vector<uint8_t> plain;
-                            if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                                std::string desc((char*)plain.data(), plain.size());
-                                if (app.ice.setRemoteDescription(desc)) {
-                                    app.peerUser = from;
-                                    std::snprintf(app.peerUser.data(), app.peerUser.size(), "%s", from.c_str());
-                                    app.iceRemoteDesc = desc;
-                                    app.iceStatus = "Got ICE answer from " + from;
-                                } else {
-                                    app.iceError = app.ice.lastError;
-                                }
-                            }
+                if (app.iceLocalDesc.empty()) {
+                    app.iceError = "Local ICE not ready yet";
+                } else {
+                    std::vector<uint8_t> plain(app.iceLocalDesc.begin(), app.iceLocalDesc.end());
+                    std::vector<uint8_t> cipher;
+                    if (app.peerPub.encrypt(plain, cipher)) {
+                        std::string b64 = B64Encode(cipher);
+                        if (app.signaling.pushEncryptedIceRequest(app.peerUser, b64, app.iceError)) {
+                            app.iceStatus = "ICE request sent to " + app.peerUser;
+                        } else {
+                            app.iceStatus = "ICE_REQUEST FAILED";
                         }
-                    } else if (!err.empty()) {
-                        app.iceError = err;
+                    } else {
+                        app.iceError = "RSA encrypt ICE request failed";
                     }
+                }
+            };
+            if (not app.iceIsOnCall) {
+                if (ImGui::Button("Send ICE request")) {
+                    SendIceRequest();
                 }
             } else {
-                if (ImGui::Button("Send ICE answer (Callee)")) {
-                    if (!app.peerPub.valid()) {
-                        app.iceError = "Peer pubkey not loaded";
-                    } else if (app.iceLocalDesc.empty()) {
-                        app.iceError = "Local ICE not ready yet";
-                    } else {
-                        std::vector<uint8_t> plain(app.iceLocalDesc.begin(), app.iceLocalDesc.end());
-                        std::vector<uint8_t> cipher;
-                        if (app.peerPub.encrypt(plain, cipher)) {
-                            std::string b64 = B64Encode(cipher);
-                            if (app.signaling.pushEncryptedIceAnswer(app.peerUser, b64, app.iceError)) {
-                                app.iceStatus = "ICE answer sent to " + app.peerUser;
-                            } else {
-                                app.iceStatus = "ICE_ANSWER FAILED";
-                            }
-                        } else {
-                            app.iceError = "RSA encrypt ICE answer failed";
-                        }
-                    }
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Poll ICE offer (Callee)")) {
-                    std::string from, blobB64, err;
-                    if (app.signaling.pollEncryptedIceOffer(from, blobB64, err)) {
-                        std::vector<uint8_t> cipher;
-                        if (B64Decode(blobB64, cipher)) {
-                            std::vector<uint8_t> plain;
-                            if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                                std::string desc((char*)plain.data(), plain.size());
-                                if (app.ice.setRemoteDescription(desc)) {
-                                    app.peerUser = from;
-                                    std::snprintf(app.peerUser.data(), app.peerUser.size(), "%s", from.c_str());
-                                    app.iceRemoteDesc = desc;
-                                    app.iceStatus = "Got ICE offer from " + from;
-                                } else {
-                                    app.iceError = app.ice.lastError;
-                                }
-                            }
-                        }
-                    } else if (!err.empty()) {
-                        app.iceError = err;
-                    }
+                std::string buttonAnswerString = std::string{"Answer "} + app.peerUser;
+                if (ImGui::Button(buttonAnswerString.c_str())) {
+                    SendIceRequest();
                 }
             }
 
@@ -2030,26 +1891,36 @@ int main(int argc, char* argv[]) {
                 app.audio.setMuted(app.micMuted);
             }
 
-            if (ImGui::Button("Rotate TX key & send to peer")) {
+            auto RotateKey = [&]() {
                 if (!app.peerPub.valid()) {
-                    app.sigError = "Peer pubkey not loaded";
-                } else {
-                    randomKey(app.txKey);
-                    app.aesTx.setKey(app.txKey);
-                    std::vector<uint8_t> plain(32);
-                    std::memcpy(plain.data(), app.txKey.key.data(), 32);
-                    std::vector<uint8_t> cipher;
-                    if (app.peerPub.encrypt(plain, cipher)) {
-                        std::string b64 = B64Encode(cipher);
-                        if (app.signaling.pushEncryptedKey(app.peerUser, b64, app.sigError)) {
-                            app.sigStatus = "TX key rotated & sent to " + app.peerUser;
-                        } else {
-                            app.sigStatus = "KEY_PUSH FAILED";
-                        }
+                    app.sigError = "Peer pubkey not loaded... Trying to load...";
+                    app.sigStatus.clear();
+                    if (app.signaling.getUserPubKey(app.peerUser, app.peerPub, app.sigError)) {
+                        app.sigStatus = "Got peer pubkey for " + app.peerUser;
+                        app.sigError.clear();
                     } else {
-                        app.sigError = "RSA encrypt key failed";
+                        app.sigStatus = "PUBKEY FAILED";
+                        return;
                     }
                 }
+                randomKey(app.txKey);
+                app.aesTx.setKey(app.txKey);
+                std::vector<uint8_t> plain(32);
+                std::memcpy(plain.data(), app.txKey.key.data(), 32);
+                std::vector<uint8_t> cipher;
+                if (app.peerPub.encrypt(plain, cipher)) {
+                    std::string b64 = B64Encode(cipher);
+                    if (app.signaling.pushEncryptedKey(app.peerUser, b64, app.sigError)) {
+                        app.sigStatus = "TX key rotated & sent to " + app.peerUser;
+                    } else {
+                        app.sigStatus = "KEY_PUSH FAILED";
+                    }
+                } else {
+                    app.sigError = "RSA encrypt key failed";
+                }
+            };
+            if (ImGui::Button("Rotate TX key & send to peer")) {
+                RotateKey();
             }
             ImGui::SameLine();
             if (ImGui::Button("Poll RX key now")) {
