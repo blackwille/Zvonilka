@@ -14,13 +14,13 @@ INSTALL_INCLUDE_DIR=${INSTALLATION_DIR}"/usr/include"
 
 mkdir -p "${INSTALL_LIB_DIR}" "${INSTALL_BIN_DIR}" "${INSTALL_INCLUDE_DIR}"
 
-find "${FULL_DEPLOY_ROOT}" -path "*/Release/x86_64/lib/*.so*" -exec cp -L {} "${INSTALL_LIB_DIR}" \;
+find "${FULL_DEPLOY_ROOT}" -path "*/Release/x86_64/lib/*.so*" -exec cp -r -L {} "${INSTALL_LIB_DIR}" \;
 echo "Copied shared libraries from Release/lib to ${INSTALL_LIB_DIR}"
 
-find "${FULL_DEPLOY_ROOT}" -path "*/Release/x86_64/bin/*" -type f -exec cp -L {} "${INSTALL_BIN_DIR}" \;
+find "${FULL_DEPLOY_ROOT}" -path "*/Release/x86_64/bin/*" -type f -exec cp -r -L {} "${INSTALL_BIN_DIR}" \;
 echo "Copied binaries from Release/bin to ${INSTALL_BIN_DIR}"
 
-find "${FULL_DEPLOY_ROOT}" -path "*/Release/x86_64/include/*" -exec cp -L {} "${INSTALL_INCLUDE_DIR}" \;
+find "${FULL_DEPLOY_ROOT}" -path "*/Release/x86_64/include/*" -exec cp -r -L {} "${INSTALL_INCLUDE_DIR}" \;
 echo "Copied headers from Release/include to ${INSTALL_INCLUDE_DIR}"
 
 # Clean up the temporary, nested full_deploy folder structure
