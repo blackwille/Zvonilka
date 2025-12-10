@@ -9,7 +9,7 @@
   * PUBKEY: выдача публичного ключа любого пользователя.
   * KEY_PUSH / KEY_POLL: буфер обмена RSA-зашифрованными AES-ключами
     (ключ зашифрован публичным ключом получателя, сервер его не видит).
-  * ICE_OFFER / ICE_POLL_OFFER / ICE_ANSWER / ICE_POLL_ANSWER:
+  * ICE_REQUEST / ICE_POLL_REQUEST:
     буфер обмена ICE-параметрами, зашифрованными RSA ключом получателя.
 
 Протокол (строки TCP, '\n'-terminated):
@@ -34,12 +34,8 @@
   KEY_POLL <token>
     -> OK <from_user> <b64_cipher_aes_key_for_me> | EMPTY | ERR auth
 
-  ICE_OFFER <token> <target_user> <b64_cipher_ice_blob_for_target>
-  ICE_POLL_OFFER <token>
-    -> OK <from_user> <b64_cipher_ice_blob_for_me> | EMPTY | ERR auth
-
-  ICE_ANSWER <token> <target_user> <b64_cipher_ice_blob_for_target>
-  ICE_POLL_ANSWER <token>
+  ICE_REQUEST <token> <target_user> <b64_cipher_ice_blob_for_target>
+  ICE_POLL_REQUEST <token>
     -> OK <from_user> <b64_cipher_ice_blob_for_me> | EMPTY | ERR auth
 """
 
@@ -68,8 +64,7 @@ USER_PUBKEY: dict[str, PublicKeyTypes] = {}
 KEY_MESSAGES: dict[str, list[tuple[str, str]]] = defaultdict(list)
 
 # user -> list[(from_user, iceBlobB64)]
-ICE_OFFERS: dict[str, list[tuple[str, str]]] = defaultdict(list)
-ICE_ANSWERS: dict[str, list[tuple[str, str]]] = defaultdict(list)
+ICE_REQUESTS: dict[str, list[tuple[str, str]]] = defaultdict(list)
 
 # серверный ключ
 SERVER_KEY = rsa.generate_private_key(
@@ -165,10 +160,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 "PUBKEY",
                 "KEY_PUSH",
                 "KEY_POLL",
-                "ICE_OFFER",
-                "ICE_POLL_OFFER",
-                "ICE_ANSWER",
-                "ICE_POLL_ANSWER",
+                "ICE_REQUEST",
+                "ICE_POLL_REQUEST",
             }:
                 # token всегда parts[1]
                 if len(parts) < 2:
@@ -221,45 +214,22 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                     await writer.drain()
                     continue
 
-                # --- ICE_OFFER ---
-                if cmd == "ICE_OFFER" and len(parts) == 4:
+                # --- ICE_REQUEST ---
+                if cmd == "ICE_REQUEST" and len(parts) == 4:
                     target, blob_b64 = parts[2], parts[3]
-                    ICE_OFFERS[target].append((user, blob_b64))
-                    print(f"[sig] ICE_OFFER from {user} -> {target}")
+                    ICE_REQUESTS[target].append((user, blob_b64))
+                    print(f"[sig] ICE_REQUEST from {user} -> {target}")
                     writer.write(b"OK\n")
                     await writer.drain()
                     continue
 
-                # --- ICE_POLL_OFFER ---
-                if cmd == "ICE_POLL_OFFER" and len(parts) == 2:
-                    queue = ICE_OFFERS[user]
+                # --- ICE_POLL_REQUEST ---
+                if cmd == "ICE_POLL_REQUEST" and len(parts) == 2:
+                    queue = ICE_REQUESTS[user]
                     if queue:
                         from_user, blob_b64 = queue.pop(0)
                         print(
-                            f"[sig] ICE_POLL_OFFER deliver to {user} from {from_user}"
-                        )
-                        writer.write(f"OK {from_user} {blob_b64}\n".encode())
-                    else:
-                        writer.write(b"EMPTY\n")
-                    await writer.drain()
-                    continue
-
-                # --- ICE_ANSWER ---
-                if cmd == "ICE_ANSWER" and len(parts) == 4:
-                    target, blob_b64 = parts[2], parts[3]
-                    ICE_ANSWERS[target].append((user, blob_b64))
-                    print(f"[sig] ICE_ANSWER from {user} -> {target}")
-                    writer.write(b"OK\n")
-                    await writer.drain()
-                    continue
-
-                # --- ICE_POLL_ANSWER ---
-                if cmd == "ICE_POLL_ANSWER" and len(parts) == 2:
-                    queue = ICE_ANSWERS[user]
-                    if queue:
-                        from_user, blob_b64 = queue.pop(0)
-                        print(
-                            f"[sig] ICE_POLL_ANSWER deliver to {user} from {from_user}"
+                            f"[sig] ICE_POLL_REQUEST deliver to {user} from {from_user}"
                         )
                         writer.write(f"OK {from_user} {blob_b64}\n".encode())
                     else:

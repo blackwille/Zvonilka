@@ -18,7 +18,7 @@
             "name": "Release Linux",
             "inherits": "Debug",
             "binaryDir": "${sourceDir}/build/${presetName}",
-            "installDir": "${sourceDir}/artifacts/linux/usr",
+            "installDir": "${sourceDir}/deploy/linux/usr",
             "toolchainFile": "${sourceDir}/dependencies/build/Release/generators/conan_toolchain.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
@@ -28,7 +28,7 @@
             "name": "Release Windows",
             "inherits": "Debug",
             "binaryDir": "${sourceDir}/build/${presetName}",
-            "installDir": "${sourceDir}/artifacts/windows",
+            "installDir": "${sourceDir}/deploy/windows",
             "toolchainFile": "${sourceDir}/dependencies/build/Release/generators/conan_toolchain.cmake",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"

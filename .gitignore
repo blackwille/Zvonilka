@@ -1,6 +1,6 @@
-artifacts/*
-!artifacts/assets/
-!artifacts/scripts/
+deploy/*
+!deploy/assets/
+!deploy/scripts/
 
 build/
 imgui_bindings/

@@ -10,7 +10,7 @@ REM Convert to absolute path
 for %%I in ("%DEPENDENCIES_DIR%") do set "DEPENDENCIES_DIR=%%~fI"
 
 REM Set installation directory
-set "INSTALL_BIN_DIR=%DEPENDENCIES_DIR%\..\artifacts\windows\bin"
+set "INSTALL_BIN_DIR=%DEPENDENCIES_DIR%\..\deploy\windows\bin"
 set "INSTALL_BIN_DIR=%INSTALL_BIN_DIR:\=\%"
 
 set "MINGW_BIN=C:\msys64\mingw64\bin"
