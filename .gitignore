@@ -1,6 +1,9 @@
-build/
-.vscode/
-imgui_bindings/
 artifacts/*
 !artifacts/assets/
 !artifacts/scripts/
+
+build/
+imgui_bindings/
+.vscode/
+compile_commands.json
+imgui.ini
