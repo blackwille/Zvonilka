@@ -1,7 +1,7 @@
 #!/bin/sh
 
 DEPENDENCIES_DIR=$(dirname $(dirname $(dirname $(realpath $0))))
-INSTALLATION_DIR=${DEPENDENCIES_DIR}/../artifacts/linux/
+INSTALLATION_DIR=${DEPENDENCIES_DIR}/../artifacts/
 conan install ${DEPENDENCIES_DIR} --settings=build_type=Release --deployer=full_deploy --deployer-folder=${INSTALLATION_DIR}
 
 FULL_DEPLOY_BASE=${INSTALLATION_DIR}"/full_deploy"

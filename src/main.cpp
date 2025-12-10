@@ -49,9 +49,8 @@
 //
 // -------------------------------------------------------
 
-#include <GL/glew.h>
+#include <GLES3/gl3.h>
 #include <SDL3/SDL.h>
-#include <SDL3/SDL_error.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_opengl.h>
 #include <SDL3/SDL_video.h>
@@ -83,12 +82,9 @@
 #include <string>
 #include <utility>
 #include <vector>
-
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#undef min
-#undef max
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -121,12 +117,17 @@
 // Helpers
 // ------------------------------------------------------------
 
+static void Fatal(const std::string& msg) {
+    std::cerr << "[FATAL] " << msg << std::endl;
+    std::exit(1);
+}
+
 #ifdef _WIN32
 struct WsaInit {
     WsaInit() {
         WSADATA wsa;
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            spdlog::critical("WSAStartup failed");
+            Fatal("WSAStartup failed");
         }
     }
     ~WsaInit() { WSACleanup(); }
@@ -368,9 +369,7 @@ class AesGcm {
 public:
     AesGcm() {
         ctx_ = EVP_CIPHER_CTX_new();
-        if (!ctx_) {
-            spdlog::critical("EVP_CIPHER_CTX_new failed");
-        }
+        if (!ctx_) Fatal("EVP_CIPHER_CTX_new failed");
     }
     ~AesGcm() { EVP_CIPHER_CTX_free(ctx_); }
 
@@ -835,7 +834,7 @@ struct IceSession {
             }
         }
 
-        g_object_set(G_OBJECT(agent), "controlling-mode", controlling ? TRUE : FALSE, nullptr);
+        g_object_set(G_OBJECT(agent), "controlling-mode", controlling ? TRUE : FALSE, NULL);
 
         g_signal_connect(agent, "candidate-gathering-done", G_CALLBACK(cb_gathering_done), this);
         g_signal_connect(agent, "component-state-changed", G_CALLBACK(cb_state_changed), this);
@@ -1342,19 +1341,23 @@ static GLuint createProgram(const std::string& vs, const std::string& fs) {
 }
 
 constexpr const char* kDefOrbVertCode = R"(
-#version 330
+#version 300 es
 
 layout(location = 0) in vec2 pos;
 out vec2 uv;
 
 void main() {
     uv = pos;
-    gl_Position = vec4(pos, 0.0, 1.0);
+    gl_Position = vec4(pos, 0.0f, 1.0f);
 }
 )";
 
 constexpr const char* kDefOrbFragCode = R"(
-#version 330
+#version 300 es
+
+#ifdef GL_ES
+precision mediump float;
+#endif
 
 in vec2 uv;
 out vec4 fragColor;
@@ -1365,28 +1368,28 @@ uniform float u_aspect;
 
 vec4 ColorOrbWave(vec4 col1, vec4 col2, float coef) {
     vec2 curPos = vec2(uv.x * u_aspect, uv.y);
-    float sine1 = sin(2. * coef * atan(curPos.y / curPos.x) + u_time * coef);
-    float sine2 = sin(4. * coef * atan(curPos.y / curPos.x) + u_time * coef);
-    float wave = 0.4 + 0.1 * pow(u_level, 0.6) * coef * (1. + sine1 * sine2);
+    float sine1 = sin(2.f * coef * atan(curPos.y / curPos.x) + u_time * coef);
+    float sine2 = sin(4.f * coef * atan(curPos.y / curPos.x) + u_time * coef);
+    float wave = 0.4f + 0.1f * pow(u_level, 0.6f) * coef * (1.f + sine1 * sine2);
 
-    float thickness = 0.01;
-    float bloor = 0.05;
-    float colorStart = wave - thickness / 2. - bloor / 2.;
-    float colorEnd = wave + thickness / 2. + bloor / 2.;
+    float thickness = 0.01f;
+    float bloor = 0.05f;
+    float colorStart = wave - thickness / 2.f - bloor / 2.f;
+    float colorEnd = wave + thickness / 2.f + bloor / 2.f;
 
     float r = length(curPos);
     float diff = r - wave;
 
-    float outerEdge = smoothstep(colorEnd, wave + thickness / 2., r);
-    float innerEdge = smoothstep(colorStart, wave - thickness / 2., r);
+    float outerEdge = smoothstep(colorEnd, wave + thickness / 2.f, r);
+    float innerEdge = smoothstep(colorStart, wave - thickness / 2.f, r);
 
-    float mixCoef = diff < 0.0 ? innerEdge : outerEdge;
+    float mixCoef = diff < 0.0f ? innerEdge : outerEdge;
     return mix(col1, col2, mixCoef);
 }
 
 void main() {
-    vec4 col1 = vec4(0.824, 0.847, 0.89, 1.); // #d2d8e3
-    vec4 col2 = vec4(0.137, 0.263, 0.53, 1.); // #234388
+    vec4 col1 = vec4(0.824f, 0.847f, 0.89f, 1.f); // #d2d8e3
+    vec4 col2 = vec4(0.137f, 0.263f, 0.53f, 1.f); // #234388
 
     vec4 result = vec4(0);
     int count = 4;
@@ -1415,7 +1418,7 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
         try {
             orbVertCode = LoadFile(execBasePath + "/shaders/voice_vis_shader.vert");
             orbFragCode = LoadFile(execBasePath + "/shaders/voice_vis_shader.frag");
-        } catch (const std::exception& e) {
+        } catch (const std::runtime_error& e) {
             orbVertCode = kDefOrbVertCode;
             orbFragCode = kDefOrbFragCode;
         }
@@ -1595,59 +1598,28 @@ int main(int argc, char* argv[]) {
     ERR_load_crypto_strings();
 
     if (not SDL_Init(SDL_INIT_VIDEO)) {
-        spdlog::critical("SDL_Init failed: {}", SDL_GetError());
-        return -1;
+        Fatal(std::string("SDL_Init failed: ") + SDL_GetError());
     }
 
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_ACCELERATED_VISUAL, 1);
 
     SDL_Window* window =
         SDL_CreateWindow("Zvonilka (ICE/TURN demo)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
-    if (!window) {
-        spdlog::critical("SDL_CreateWindow failed: {}", SDL_GetError());
-        return -1;
-    }
+    if (!window) Fatal("SDL_CreateWindow failed");
     SDL_GLContext glctx = SDL_GL_CreateContext(window);
-    if (!glctx) {
-        spdlog::critical("SDL_GL_CreateContext failed: {}", SDL_GetError());
-        return -1;
-    }
-
     SDL_GL_MakeCurrent(window, glctx);
     SDL_GL_SetSwapInterval(1);
-
-    glewInit();
-
-    // 7. Check GPU information
-    const GLubyte* renderer = glGetString(GL_RENDERER);
-    const GLubyte* vendor = glGetString(GL_VENDOR);
-    const GLubyte* version = glGetString(GL_VERSION);
-    const GLubyte* glsl = glGetString(GL_SHADING_LANGUAGE_VERSION);
-
-    spdlog::debug("GPU Vendor: {}", vendor ? (const char*)vendor : "Unknown");
-    spdlog::debug("GPU Renderer: {}", renderer ? (const char*)renderer : "Unknown");
-    spdlog::debug("OpenGL Version: {}", version ? (const char*)version : "Unknown");
-    spdlog::debug("GLSL Version: {}", glsl ? (const char*)glsl : "Unknown");
 
     // ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
-
-    if (!ImGui_ImplSDL3_InitForOpenGL(window, glctx)) {
-        spdlog::critical("Failed to initialize ImGui SDL3 backend: {}", SDL_GetError());
-        return -1;
-    }
-    if (!ImGui_ImplOpenGL3_Init("#version 330")) {
-        spdlog::critical("Failed to initialize ImGui OpenGL3 backend");
-        return -1;
-    }
+    ImGui_ImplSDL3_InitForOpenGL(window, glctx);
+    ImGui_ImplOpenGL3_Init("#version 300 es");
 
     if (!app.audio.init()) {
         std::cerr << "Audio init failed\n";
@@ -1897,8 +1869,8 @@ int main(int argc, char* argv[]) {
                 app.iceStatus.clear();
                 std::string stun = stunWTurnHostBuf;
                 std::string turn = stunWTurnHostBuf;
-                uint16_t stunPort = static_cast<uint16_t>(std::max(stunWTurnPortUI, 1));
-                uint16_t turnPort = static_cast<uint16_t>(std::max(stunWTurnPortUI, 1));
+                uint16_t stunPort = (uint16_t)std::max(stunWTurnPortUI, 1);
+                uint16_t turnPort = (uint16_t)std::max(stunWTurnPortUI, 1);
                 if (app.ice.init(stun, stunPort, turn, turnPort, sigUserBuf, sigPassBuf, app.forceTurnOnly,
                                  app.iceIsCaller)) {
                     app.iceInited = true;

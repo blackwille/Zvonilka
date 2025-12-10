@@ -14,15 +14,14 @@ class ZvonilkaDeps(ConanFile):
     def requirements(self):
         if self.requires is None:
             return
-        self.requires("glew/2.2.0")
-        self.requires("imgui/1.92.2b-docking")
-        self.requires("libffi/3.4.4")
-        self.requires("libnice/0.1.21")
-        self.requires("miniaudio/0.11.22")
-        self.requires("openssl/3.6.0")
-        self.requires("opus/1.5.2")
-        self.requires("sdl/3.2.20")
         self.requires("spdlog/1.16.0")
+        self.requires("miniaudio/0.11.22")
+        self.requires("imgui/1.92.2b-docking")
+        self.requires("sdl/3.2.20")
+        self.requires("opus/1.5.2")
+        self.requires("libnice/0.1.21")
+        self.requires("libffi/3.4.4")
+        self.requires("pulseaudio/17.0")
 
     def layout(self):
         cmake_layout(self)
@@ -35,6 +34,7 @@ class ZvonilkaDeps(ConanFile):
         tc.cache_variables["CMAKE_EXPORT_COMPILE_COMMANDS"] = "ON"
         tc.generate()
 
+        # backends для UI (SDL/OpenGL3) в backends
         pkg_folder = self.dependencies["imgui"].package_folder
         copy(
             self,
