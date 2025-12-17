@@ -61,6 +61,7 @@
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 #include <opus_defines.h>
+#include <spdlog/common.h>
 #include <sys/types.h>
 
 #include <algorithm>
@@ -75,11 +76,13 @@
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -489,7 +492,8 @@ public:
         }
     }
 
-    void setMuted(bool m) { muted_.store(m); }
+    void setMuted(bool m) { muted_.store(m, std::memory_order::relaxed); }
+    bool isMuted() { return muted_.load(std::memory_order::relaxed); }
 
     bool popCaptured(AudioFrame& frame) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -550,7 +554,7 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
 
         // Захват
-        if (!muted_.load()) {
+        if (!muted_.load(std::memory_order::relaxed)) {
             // Добавляем свежие сэмплы в аккумулятор
             captureAccum_.insert(captureAccum_.end(), in, in + frames);
 
@@ -1494,7 +1498,10 @@ void DrawVoiceOrb(const std::string& execPath, float level) {
 // App state
 // ------------------------------------------------------------
 
-struct AppState {
+struct App {
+    std::mutex mtx;
+    std::atomic<bool> isRunning{false};
+
     // audio
     AudioEngine audio;
     OpusCodec opus;
@@ -1527,6 +1534,173 @@ struct AppState {
     bool forceTurnOnly{false};
     float inLevel{0.0f};
     float outlevel{0.0f};
+
+    void init() {
+        if (!audio.init()) {
+            std::cerr << "Audio init failed\n";
+        }
+        if (!opus.init()) {
+            std::cerr << "Opus init failed\n";
+        }
+
+        randomKey(txKey);
+        aesTx.setKey(txKey);
+        randomKey(rxKey);
+        aesRx.setKey(rxKey);
+
+        isRunning = true;
+        netAudioLoopThread = std::make_unique<std::thread>(&App::netAudioLoop, this);
+        pollKeysLoopThread = std::make_unique<std::thread>(&App::pollKeysLoop, this);
+    }
+
+    using SteadyTimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+    std::unique_ptr<std::thread> pollKeysLoopThread{nullptr};
+    void pollKeysLoop() {
+        while (isRunning.load(std::memory_order::relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+
+            mtx.lock();
+            if (signaling.token().empty()) {
+                mtx.unlock();
+                continue;
+            }
+            mtx.unlock();
+
+            std::string from, keyCipherB64, err;
+            if (signaling.pollEncryptedKey(from, keyCipherB64, err)) {
+                std::vector<uint8_t> cipher;
+                if (B64Decode(keyCipherB64, cipher)) {
+                    std::vector<uint8_t> plain;
+                    std::lock_guard guard{mtx};
+                    if (signaling.clientKey().decrypt(cipher, plain)) {
+                        if (plain.size() == 32) {
+                            std::memcpy(rxKey.key.data(), plain.data(), 32);
+                            aesRx.setKey(rxKey);
+                            sigStatus = "Received new RX key from " + from;
+                        }
+                    }
+                }
+            }
+
+            if (not ice.isConnected && ice.isGatheringDone && not ice.isRemoteSet) {
+                std::string from, blobB64, err;
+                if (signaling.pollEncryptedIceRequest(from, blobB64, err)) {
+                    std::vector<uint8_t> cipher;
+                    if (B64Decode(blobB64, cipher)) {
+                        std::vector<uint8_t> plain;
+                        std::lock_guard guard{mtx};
+                        if (signaling.clientKey().decrypt(cipher, plain)) {
+                            std::string desc((char*)plain.data(), plain.size());
+                            if (ice.setRemoteDescription(desc)) {
+                                peerUser = from;
+                                iceRemoteDesc = desc;
+                                iceStatus = "Got ICE request from " + from;
+                            } else {
+                                iceError = ice.lastError;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::unique_ptr<std::thread> netAudioLoopThread{nullptr};
+    double netAudioLoopTickRate = 0;
+    void netAudioLoop() {
+        auto lastNetTick = std::chrono::steady_clock::now();
+        while (isRunning.load(std::memory_order::relaxed)) {
+            constexpr double milliSecInSec = 1'000.;
+            constexpr int kLoopTargetTickRate = 100;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(floor(milliSecInSec / kLoopTargetTickRate))));
+
+            if (not ice.isConnected && not audio.isMuted()) {
+                audio.setMuted(true);
+            }
+            std::lock_guard guard{mtx};
+
+            // прокручиваем glib/libnice
+            ice.pump();
+
+            // --- network / ICE tick ---
+            auto now = std::chrono::steady_clock::now();
+            constexpr double microSecInSec = 1'000'000.;
+            netAudioLoopTickRate =
+                microSecInSec /
+                static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(now - lastNetTick).count());
+            lastNetTick = now;
+
+            // capture & send
+            AudioFrame f;
+            if (ice.isConnected && ice.isRemoteSet && ice.isAnswerSent) {
+                while (audio.popCaptured(f)) {
+                    inLevel = *std::ranges::max_element(f.samples);
+
+                    std::vector<uint8_t> opusPkt;
+                    if (opus.encode(f, opusPkt)) {
+                        std::vector<uint8_t> payload;
+                        if (encryptionEnabled) {
+                            uint8_t iv[12];
+                            RAND_bytes(iv, sizeof(iv));
+                            std::array<uint8_t, 16> tag{};
+                            aesTx.encrypt(opusPkt.data(), opusPkt.size(), nullptr, 0, iv, payload, tag);
+                            // [E][iv(12)][tag(16)][cipher]
+                            std::vector<uint8_t> pkt;
+                            pkt.reserve(1 + 12 + 16 + payload.size());
+                            pkt.push_back(1);  // encrypted
+                            pkt.insert(pkt.end(), iv, iv + 12);
+                            pkt.insert(pkt.end(), tag.begin(), tag.end());
+                            pkt.insert(pkt.end(), payload.begin(), payload.end());
+                            ice.send(pkt.data(), pkt.size());
+                        } else {
+                            // [0][plain opus]
+                            std::vector<uint8_t> pkt;
+                            pkt.reserve(1 + opusPkt.size());
+                            pkt.push_back(0);
+                            pkt.insert(pkt.end(), opusPkt.begin(), opusPkt.end());
+                            ice.send(pkt.data(), pkt.size());
+                        }
+                    }
+                }
+            }
+
+            // receive & playback
+            for (;;) {
+                std::vector<uint8_t> pkt;
+                if (!ice.recvPacket(pkt)) break;
+                if (pkt.empty()) continue;
+                uint8_t encFlag = pkt[0];
+                std::vector<uint8_t> opusPkt;
+                if (encFlag == 1) {
+                    if (pkt.size() <= 1 + 12 + 16) continue;
+                    uint8_t iv[12];
+                    std::memcpy(iv, &pkt[1], 12);
+                    uint8_t tag[16];
+                    std::memcpy(tag, &pkt[13], 16);
+                    std::vector<uint8_t> cipher(pkt.begin() + 29, pkt.end());
+                    std::vector<uint8_t> plain;
+                    if (!aesRx.decrypt(cipher.data(), cipher.size(), nullptr, 0, iv, tag, plain)) {
+                        std::cerr << "AES decrypt failed\n";
+                        continue;
+                    }
+                    opusPkt = std::move(plain);
+                } else {
+                    opusPkt.assign(pkt.begin() + 1, pkt.end());
+                }
+
+                AudioFrame out;
+                if (opus.decode(opusPkt, out)) {
+                    outlevel = *std::ranges::max_element(out.samples);
+                    audio.pushPlayback(out);
+                }
+            }
+
+            if (ice.isGatheringDone && iceLocalDesc.empty()) {
+                ice.buildLocalDescription(iceLocalDesc);
+            }
+        }
+    };
 };
 
 // ------------------------------------------------------------
@@ -1542,7 +1716,12 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::set_default_logger(spdlog::stdout_color_mt("default", spdlog::color_mode::always));
+
+#ifdef _DEBUG
     spdlog::set_level(spdlog::level::debug);
+#else
+    spdlog::set_level(spdlog::level::info);
+#endif
 
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
@@ -1577,16 +1756,15 @@ int main(int argc, char* argv[]) {
 
     glewInit();
 
-    // 7. Check GPU information
-    const GLubyte* renderer = glGetString(GL_RENDERER);
-    const GLubyte* vendor = glGetString(GL_VENDOR);
-    const GLubyte* version = glGetString(GL_VERSION);
-    const GLubyte* glsl = glGetString(GL_SHADING_LANGUAGE_VERSION);
-
-    spdlog::debug("GPU Vendor: {}", vendor ? (const char*)vendor : "Unknown");
-    spdlog::debug("GPU Renderer: {}", renderer ? (const char*)renderer : "Unknown");
-    spdlog::debug("OpenGL Version: {}", version ? (const char*)version : "Unknown");
-    spdlog::debug("GLSL Version: {}", glsl ? (const char*)glsl : "Unknown");
+    // Debug GPU information
+    auto GlGetStdString = [](GLenum name) -> std::string {
+        const GLubyte* pStr = glGetString(name);
+        return pStr ? reinterpret_cast<const char*>(pStr) : "Unknown";  // NOLINT
+    };
+    spdlog::debug("GPU Renderer: {}", GlGetStdString(GL_RENDER));
+    spdlog::debug("GPU Vendor: {}", GlGetStdString(GL_VENDOR));
+    spdlog::debug("OpenGL Version: {}", GlGetStdString(GL_VERSION));
+    spdlog::debug("GLSL Version: {}", GlGetStdString(GL_SHADING_LANGUAGE_VERSION));
 
     // ImGui
     IMGUI_CHECKVERSION();
@@ -1602,24 +1780,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    AppState app;
-    if (!app.audio.init()) {
-        std::cerr << "Audio init failed\n";
-    }
-    if (!app.opus.init()) {
-        std::cerr << "Opus init failed\n";
-    }
-
-    randomKey(app.txKey);
-    randomKey(app.rxKey);
-    app.aesTx.setKey(app.txKey);
-    app.aesRx.setKey(app.rxKey);
-
-    bool running = true;
-    auto lastNetTick = std::chrono::steady_clock::now();
-    auto lastKeyPoll = std::chrono::steady_clock::now();
-    auto lastIcePoll = std::chrono::steady_clock::now();
-
     // UI state
     static char serverBuf[64] = "213.171.24.94";
     static int sigPort = 7777;
@@ -1630,132 +1790,15 @@ int main(int argc, char* argv[]) {
     memcpy(static_cast<void*>(sigUserBuf), defaultCaller.c_str(), defaultCaller.size());
     memcpy(static_cast<void*>(callingUserBuf), defaultCallee.c_str(), defaultCallee.size());
 
-    while (running) {
+    App app;
+    app.init();
+    while (app.isRunning.load(std::memory_order::relaxed)) {
+        app.mtx.lock();
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             ImGui_ImplSDL3_ProcessEvent(&ev);
-            if (ev.type == SDL_EVENT_QUIT) running = false;
-        }
-
-        // прокручиваем glib/libnice
-        app.ice.pump();
-
-        // --- network / ICE tick ---
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastNetTick > std::chrono::milliseconds(1)) {
-            lastNetTick = now;
-
-            // capture & send
-            AudioFrame f;
-            if (app.ice.isConnected && app.ice.isRemoteSet && app.ice.isAnswerSent) {
-                while (app.audio.popCaptured(f)) {
-                    app.inLevel = *std::ranges::max_element(f.samples);
-
-                    std::vector<uint8_t> opusPkt;
-                    if (app.opus.encode(f, opusPkt)) {
-                        std::vector<uint8_t> payload;
-                        if (app.encryptionEnabled) {
-                            uint8_t iv[12];
-                            RAND_bytes(iv, sizeof(iv));
-                            std::array<uint8_t, 16> tag{};
-                            app.aesTx.encrypt(opusPkt.data(), opusPkt.size(), nullptr, 0, iv, payload, tag);
-                            // [E][iv(12)][tag(16)][cipher]
-                            std::vector<uint8_t> pkt;
-                            pkt.reserve(1 + 12 + 16 + payload.size());
-                            pkt.push_back(1);  // encrypted
-                            pkt.insert(pkt.end(), iv, iv + 12);
-                            pkt.insert(pkt.end(), tag.begin(), tag.end());
-                            pkt.insert(pkt.end(), payload.begin(), payload.end());
-                            app.ice.send(pkt.data(), pkt.size());
-                        } else {
-                            // [0][plain opus]
-                            std::vector<uint8_t> pkt;
-                            pkt.reserve(1 + opusPkt.size());
-                            pkt.push_back(0);
-                            pkt.insert(pkt.end(), opusPkt.begin(), opusPkt.end());
-                            app.ice.send(pkt.data(), pkt.size());
-                        }
-                    }
-                }
-            }
-
-            // receive & playback
-            for (;;) {
-                std::vector<uint8_t> pkt;
-                if (!app.ice.recvPacket(pkt)) break;
-                if (pkt.empty()) continue;
-                uint8_t encFlag = pkt[0];
-                std::vector<uint8_t> opusPkt;
-                if (encFlag == 1) {
-                    if (pkt.size() <= 1 + 12 + 16) continue;
-                    uint8_t iv[12];
-                    std::memcpy(iv, &pkt[1], 12);
-                    uint8_t tag[16];
-                    std::memcpy(tag, &pkt[13], 16);
-                    std::vector<uint8_t> cipher(pkt.begin() + 29, pkt.end());
-                    std::vector<uint8_t> plain;
-                    if (!app.aesRx.decrypt(cipher.data(), cipher.size(), nullptr, 0, iv, tag, plain)) {
-                        std::cerr << "AES decrypt failed\n";
-                        continue;
-                    }
-                    opusPkt = std::move(plain);
-                } else {
-                    opusPkt.assign(pkt.begin() + 1, pkt.end());
-                }
-
-                AudioFrame out;
-                if (app.opus.decode(opusPkt, out)) {
-                    app.outlevel = *std::ranges::max_element(out.samples);
-                    app.audio.pushPlayback(out);
-                }
-            }
-        }
-
-        // периодический автопул ключей и ICE-ответов (чтобы не дергать руками
-        // слишком часто)
-        if (!app.signaling.token().empty()) {
-            if (now - lastKeyPoll > std::chrono::milliseconds(3000)) {
-                lastKeyPoll = now;
-                std::string from, keyCipherB64, err;
-                if (app.signaling.pollEncryptedKey(from, keyCipherB64, err)) {
-                    std::vector<uint8_t> cipher;
-                    if (B64Decode(keyCipherB64, cipher)) {
-                        std::vector<uint8_t> plain;
-                        if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                            if (plain.size() == 32) {
-                                std::memcpy(app.rxKey.key.data(), plain.data(), 32);
-                                app.aesRx.setKey(app.rxKey);
-                                app.sigStatus = "Received new RX key from " + from;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (app.ice.isGatheringDone && app.iceLocalDesc.empty()) {
-                app.ice.buildLocalDescription(app.iceLocalDesc);
-            }
-            if (now - lastIcePoll > std::chrono::milliseconds(3000)) {
-                lastIcePoll = now;
-                if (not app.ice.isConnected && app.ice.isGatheringDone && not app.ice.isRemoteSet) {
-                    std::string from, blobB64, err;
-                    if (app.signaling.pollEncryptedIceRequest(from, blobB64, err)) {
-                        std::vector<uint8_t> cipher;
-                        if (B64Decode(blobB64, cipher)) {
-                            std::vector<uint8_t> plain;
-                            if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                                std::string desc((char*)plain.data(), plain.size());
-                                if (app.ice.setRemoteDescription(desc)) {
-                                    app.peerUser = from;
-                                    app.iceRemoteDesc = desc;
-                                    app.iceStatus = "Got ICE request from " + from;
-                                } else {
-                                    app.iceError = app.ice.lastError;
-                                }
-                            }
-                        }
-                    }
-                }
+            if (ev.type == SDL_EVENT_QUIT) {
+                app.isRunning.store(false, std::memory_order::relaxed);
             }
         }
 
@@ -1791,8 +1834,8 @@ int main(int argc, char* argv[]) {
             }
         };
 
-        // Auth
         if (app.signaling.token().empty()) {
+            // Auth
             ImGui::InputText("Login", sigUserBuf, sizeof(sigUserBuf));
             ImGui::InputText("Password", sigPassBuf, sizeof(sigPassBuf), ImGuiInputTextFlags_Password);
             if (ImGui::Button("AUTH")) {
@@ -1807,16 +1850,9 @@ int main(int argc, char* argv[]) {
                     app.sigStatus = "AUTH FAILED";
                 }
             }
-
-            if (ImGui::CollapsingHeader("Debug")) {
-                ImGui::InputText("Server", serverBuf, sizeof(serverBuf));
-                ImGui::InputInt("Signaling port", &sigPort);
-                ImGui::InputInt("STUN/TURN port", &stunWTurnPort);
-            }
         } else {
             // ICE
             ImGui::InputText("Calling user", callingUserBuf, sizeof(callingUserBuf));
-            app.peerUser = std::string{callingUserBuf};
 
             auto SendIceRequest = [&]() {
                 app.iceStatus.clear();
@@ -1863,6 +1899,7 @@ int main(int argc, char* argv[]) {
                 }
                 ImGui::PopStyleColor();
             } else if (app.ice.isGatheringDone) {
+                app.peerUser = std::string{callingUserBuf};
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.25, 0.25, 0.5, 1.});
                 if (ImGui::Button("Send ICE request")) {
                     SendIceRequest();
@@ -1871,6 +1908,11 @@ int main(int argc, char* argv[]) {
             }
 
             if (ImGui::CollapsingHeader("Debug")) {
+                ImGui::Text("FrameRate: %.2f", ImGui::GetIO().Framerate);
+                ImGui::Text("NetAudioTickRate: %.2f", app.netAudioLoopTickRate);
+                ImGui::InputText("Server", serverBuf, sizeof(serverBuf));
+                ImGui::InputInt("Signaling port", &sigPort);
+                ImGui::InputInt("STUN/TURN port", &stunWTurnPort);
                 ImGui::Checkbox("Force TURN ICE only (no direct)", &app.forceTurnOnly);
 
                 if (!app.sigStatus.empty()) ImGui::Text("Status: %s", app.sigStatus.c_str());
@@ -1927,36 +1969,17 @@ int main(int argc, char* argv[]) {
             if (ImGui::Button("Rotate TX key & send to peer")) {
                 RotateKey();
             }
-            ImGui::SameLine();
-            if (ImGui::Button("Poll RX key now")) {
-                std::string from, keyCipherB64, err;
-                if (app.signaling.pollEncryptedKey(from, keyCipherB64, err)) {
-                    std::vector<uint8_t> cipher;
-                    if (B64Decode(keyCipherB64, cipher)) {
-                        std::vector<uint8_t> plain;
-                        if (app.signaling.clientKey().decrypt(cipher, plain)) {
-                            if (plain.size() == 32) {
-                                std::memcpy(app.rxKey.key.data(), plain.data(), 32);
-                                app.aesRx.setKey(app.rxKey);
-                                app.sigStatus = "Manually received RX key from " + from;
-                            }
-                        }
-                    }
-                } else {
-                    if (!err.empty()) app.sigError = err;
-                }
-            }
 
             ImGui::Text("Mic level: %.3f", app.inLevel);
             ImGui::ProgressBar(app.inLevel, ImVec2(0.0f, 0.0f));
             ImGui::SameLine();
-            if (ImGui::Checkbox("Mic muted", &app.micMuted)) {
-                app.audio.setMuted(app.micMuted);
-            }
+            ImGui::Checkbox("Mic muted", &app.micMuted);
+            app.audio.setMuted(app.micMuted);
 
             ImGui::Text("Caller level: %.3f", app.outlevel);
             DrawVoiceOrb(argv[0], app.outlevel);
         }
+        app.mtx.unlock();
 
         ImGui::End();
 
@@ -1964,6 +1987,8 @@ int main(int argc, char* argv[]) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
     }
+    app.netAudioLoopThread->join();
+    app.pollKeysLoopThread->join();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

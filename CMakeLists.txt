@@ -27,6 +27,10 @@ add_executable(${PROJECT_NAME}
     ${DEPENDENCIES_DIR}/imgui_bindings/imgui_impl_opengl3.cpp
 )
 
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    $<$<CONFIG:Debug>:_DEBUG>
+)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     GLEW::GLEW
     imgui::imgui
